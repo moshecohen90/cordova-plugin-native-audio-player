@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plugin xmlns="http://apache.org/cordova/ns/plugins/1.0"
+        xmlns:android="http://schemas.android.com/apk/res/android"
+        id="cordova-plugin-native-audio-player"
+        version="0.1.0">
+
+  <name>NativeAudioPlayer</name>
+  <description>Native background audio with a Spotify/YouTube-style OS media player (Android Media3, iOS AVPlayer + Now Playing).</description>
+  <license>MIT</license>
+  <keywords>cordova,audio,media3,exoplayer,mediasession,now playing,background audio</keywords>
+
+  <js-module src="www/native-audio-player.js" name="NativeAudioPlayer">
+    <clobbers target="NativeAudioPlayer" />
+  </js-module>
+
+  <!-- ================= Android ================= -->
+  <platform name="android">
+    <config-file target="res/xml/config.xml" parent="/*">
+      <feature name="NativeAudioPlayer">
+        <param name="android-package" value="com.moshecohen.nativeaudio.NativeAudioPlayer" />
+      </feature>
+    </config-file>
+
+    <config-file target="AndroidManifest.xml" parent="/manifest">
+      <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+      <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+      <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    </config-file>
+
+    <config-file target="AndroidManifest.xml" parent="/manifest/application">
+      <service
+        android:name="com.moshecohen.nativeaudio.PlaybackService"
+        android:exported="true"
+        android:foregroundServiceType="mediaPlayback">
+        <intent-filter>
+          <action android:name="androidx.media3.session.MediaSessionService" />
+        </intent-filter>
+      </service>
+    </config-file>
+
+    <source-file src="src/android/NativeAudioPlayer.java" target-dir="src/com/moshecohen/nativeaudio" />
+    <source-file src="src/android/PlaybackService.java" target-dir="src/com/moshecohen/nativeaudio" />
+
+    <!-- Silent loop played under TTS so the OS media player still shows (no native track otherwise). -->
+    <resource-file src="src/assets/silence.mp3" target="res/raw/silence.mp3" />
+
+    <framework src="androidx.media3:media3-exoplayer:1.4.1" />
+    <framework src="androidx.media3:media3-session:1.4.1" />
+    <framework src="androidx.media3:media3-ui:1.4.1" />
+  </platform>
+
+  <!-- ================= iOS ================= -->
+  <platform name="ios">
+    <config-file target="config.xml" parent="/*">
+      <feature name="NativeAudioPlayer">
+        <param name="ios-package" value="NativeAudioPlayer" />
+      </feature>
+    </config-file>
+
+    <config-file target="*-Info.plist" parent="UIBackgroundModes">
+      <array>
+        <string>audio</string>
+      </array>
+    </config-file>
+
+    <header-file src="src/ios/NativeAudioPlayer.h" />
+    <source-file src="src/ios/NativeAudioPlayer.m" />
+
+    <!-- Silent loop played under TTS so the Now Playing card still shows (no native track otherwise). -->
+    <resource-file src="src/assets/silence.mp3" />
+
+    <framework src="AVFoundation.framework" />
+    <framework src="MediaPlayer.framework" />
+  </platform>
+</plugin>

@@ -1,0 +1,38 @@
+{
+  "name": "cordova-plugin-native-audio-player",
+  "version": "0.1.0",
+  "description": "Native background audio with a Spotify/YouTube-style OS media player (Android Media3, iOS AVPlayer + Now Playing).",
+  "cordova": {
+    "id": "cordova-plugin-native-audio-player",
+    "platforms": [
+      "android",
+      "ios"
+    ]
+  },
+  "keywords": [
+    "ecosystem:cordova",
+    "cordova-android",
+    "cordova-ios",
+    "audio",
+    "media3",
+    "exoplayer",
+    "background audio"
+  ],
+  "engines": {
+    "cordovaDependencies": {
+      "3.0.0": {
+        "cordova-android": ">=13.0.0"
+      }
+    }
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/moshecohen90/cordova-plugin-native-audio-player.git"
+  },
+  "author": "Moshe Cohen",
+  "bugs": {
+    "url": "https://github.com/moshecohen90/cordova-plugin-native-audio-player/issues"
+  },
+  "homepage": "https://github.com/moshecohen90/cordova-plugin-native-audio-player#readme"
+}
