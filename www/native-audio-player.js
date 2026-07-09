@@ -49,6 +49,16 @@ var NativeAudioPlayer = {
   },
 
   /**
+   * Append upcoming tracks AFTER the currently playing one (iOS): the current track keeps
+   * playing untouched (optionally clipped to currentEndMs) and the OS advances into the
+   * appended list natively — safe to call mid-track on backgrounding.
+   */
+  appendQueue: function (items, currentEndMs, success, error) {
+    startEvents();
+    exec(success, error, SERVICE, 'appendQueue', [items || [], currentEndMs || 0]);
+  },
+
+  /**
    * Play a bundled silent track on loop, showing the OS media player (Now Playing /
    * notification) with the given metadata + transport controls. Used during TTS, which
    * produces no native track of its own, so the lock-screen player still appears.

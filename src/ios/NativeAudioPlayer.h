@@ -5,6 +5,7 @@
 - (void)startEvents:(CDVInvokedUrlCommand*)command;
 - (void)load:(CDVInvokedUrlCommand*)command;
 - (void)setQueue:(CDVInvokedUrlCommand*)command;
+- (void)appendQueue:(CDVInvokedUrlCommand*)command;
 - (void)playSilentLoop:(CDVInvokedUrlCommand*)command;
 - (void)play:(CDVInvokedUrlCommand*)command;
 - (void)pause:(CDVInvokedUrlCommand*)command;

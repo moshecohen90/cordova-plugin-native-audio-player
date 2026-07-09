@@ -64,7 +64,9 @@
         item.forwardPlaybackEndTime = CMTimeMakeWithSeconds(self.clipDurationMs / 1000.0, NSEC_PER_SEC);
     }
     self.displayDurationMs = [[opts objectForKey:@"displayDurationMs"] doubleValue];
-    self.player = [AVPlayer playerWithPlayerItem:item];
+    // AVQueuePlayer from the start: a background handoff can then APPEND upcoming verses
+    // after this one with zero interruption (an AVPlayer can't be upgraded in place).
+    self.player = [AVQueuePlayer queuePlayerWithItems:@[item]];
     [self setupTimeObserver];
     [self setupRemoteCommands];
 
@@ -111,30 +113,9 @@
 
     NSMutableArray<AVPlayerItem*> *playerItems = [NSMutableArray array];
     for (NSInteger i = start; i < (NSInteger)items.count; i++) {
-        NSDictionary *o = items[i];
-        NSURL *u = [self urlFromString:o[@"url"]];
-        if (u == nil) { continue; }
-        AVPlayerItem *item = [AVPlayerItem playerItemWithURL:u];
-        item.audioTimePitchAlgorithm = AVAudioTimePitchAlgorithmSpectral;
-        double dur = [[o objectForKey:@"durationMs"] doubleValue];
-        if (dur > 0) {
-            // Clip each verse to its real speech length (the MP3 duration is unreliable).
-            item.forwardPlaybackEndTime = CMTimeMakeWithSeconds(dur / 1000.0, NSEC_PER_SEC);
-        }
+        AVPlayerItem *item = [self buildQueueItemFrom:items[i] absIndex:i];
+        if (item == nil) { continue; }
         [playerItems addObject:item];
-        [self.queueAbsIndex addObject:@(i)];
-        [self.queueItems addObject:item];
-        [[NSNotificationCenter defaultCenter] addObserver:self
-                                                 selector:@selector(queueItemDidEnd:)
-                                                     name:AVPlayerItemDidPlayToEndTimeNotification
-                                                   object:item];
-        // Surface stream failures (404 / network drop): without this the queue stalls
-        // silently forever with a frozen Now Playing card.
-        [[NSNotificationCenter defaultCenter] addObserver:self
-                                                 selector:@selector(queueItemFailed:)
-                                                     name:AVPlayerItemFailedToPlayToEndTimeNotification
-                                                   object:item];
-        [item addObserver:self forKeyPath:@"status" options:NSKeyValueObservingOptionNew context:nil];
     }
     if (playerItems.count == 0) { [self fail:command msg:@"no valid items"]; return; }
 
@@ -156,7 +137,7 @@
 
 /** Meta of the currently playing queue item (player order -> absolute index). */
 - (NSDictionary *)currentQueueMeta {
-    if (!self.queueActive || self.queueIndex >= (NSInteger)self.queueAbsIndex.count) { return @{}; }
+    if (!self.queueActive || self.queueIndex < 0 || self.queueIndex >= (NSInteger)self.queueAbsIndex.count) { return @{}; }
     NSInteger abs = [self.queueAbsIndex[self.queueIndex] integerValue];
     return abs < (NSInteger)self.queueMeta.count ? self.queueMeta[abs] : @{};
 }
@@ -242,6 +223,65 @@
     [self updateNowPlayingInfo:opts];
     [self updateNowPlayingElapsed];
     [self emitState];
+    [self ok:command];
+}
+
+// Build one queue AVPlayerItem (clip + pitch + observers) and register bookkeeping.
+- (AVPlayerItem *)buildQueueItemFrom:(NSDictionary *)o absIndex:(NSInteger)i {
+    NSURL *u = [self urlFromString:o[@"url"]];
+    if (u == nil) { return nil; }
+    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:u];
+    item.audioTimePitchAlgorithm = AVAudioTimePitchAlgorithmSpectral;
+    double dur = [[o objectForKey:@"durationMs"] doubleValue];
+    if (dur > 0) {
+        item.forwardPlaybackEndTime = CMTimeMakeWithSeconds(dur / 1000.0, NSEC_PER_SEC);
+    }
+    [self.queueAbsIndex addObject:@(i)];
+    [self.queueItems addObject:item];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(queueItemDidEnd:)
+        name:AVPlayerItemDidPlayToEndTimeNotification object:item];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(queueItemFailed:)
+        name:AVPlayerItemFailedToPlayToEndTimeNotification object:item];
+    [item addObserver:self forKeyPath:@"status" options:NSKeyValueObservingOptionNew context:nil];
+    return item;
+}
+
+// Background handoff WITHOUT touching the playing verse: append the upcoming verses after
+// the current item and give the current item a real end point (JS is about to be frozen,
+// so it can no longer cut the trailing silence or advance verses itself).
+- (void)appendQueue:(CDVInvokedUrlCommand*)command {
+    NSArray *items = [command argumentAtIndex:0 withDefault:@[]];
+    double currentEndMs = [[command argumentAtIndex:1 withDefault:@0] doubleValue];
+    if (![self.player isKindOfClass:[AVQueuePlayer class]] || self.player.currentItem == nil) {
+        [self fail:command msg:@"no active player"]; return;
+    }
+    if (items.count == 0) { [self fail:command msg:@"empty items"]; return; }
+    AVQueuePlayer *qp = (AVQueuePlayer *)self.player;
+
+    if (currentEndMs > 0 && currentEndMs > [self positionMs] + 300) {
+        self.player.currentItem.forwardPlaybackEndTime = CMTimeMakeWithSeconds(currentEndMs / 1000.0, NSEC_PER_SEC);
+    }
+
+    self.queueMeta = [items mutableCopy];
+    self.queueAbsIndex = [NSMutableArray array];
+    self.queueItems = [NSMutableArray array];
+    self.queueIndex = -1; // the pre-queue item is still playing
+
+    AVPlayerItem *after = qp.items.lastObject;
+    NSInteger appended = 0;
+    for (NSInteger i = 0; i < (NSInteger)items.count; i++) {
+        AVPlayerItem *item = [self buildQueueItemFrom:items[i] absIndex:i];
+        if (item == nil) { continue; }
+        if ([qp canInsertItem:item afterItem:after]) {
+            [qp insertItem:item afterItem:after];
+            after = item;
+            appended++;
+        }
+    }
+    if (appended == 0) { [self fail:command msg:@"nothing appended"]; return; }
+    self.queueActive = YES;
+    self.shouldBePlaying = YES;
+    NSLog(@"[NativeAudioPlayer] appendQueue: %ld items after current (currentEndMs=%.0f)", (long)appended, currentEndMs);
     [self ok:command];
 }
 
@@ -336,7 +376,7 @@
         if (s == nil || s.player.rate == 0) { return; }
         NSMutableDictionary *p = [NSMutableDictionary dictionaryWithDictionary:
             @{ @"positionMs": @([s positionMs]), @"durationMs": @([s durationMs]) }];
-        if (s.queueActive && s.queueIndex < (NSInteger)s.queueAbsIndex.count) {
+        if (s.queueActive && s.queueIndex >= 0 && s.queueIndex < (NSInteger)s.queueAbsIndex.count) {
             p[@"index"] = s.queueAbsIndex[s.queueIndex];
             p[@"id"] = [s currentQueueMeta][@"id"] ?: @"";
         }
@@ -426,6 +466,11 @@
         // Silent keep-alive track: restart it seamlessly instead of ending.
         [self.player seekToTime:kCMTimeZero];
         [self.player play];
+        return;
+    }
+    if (self.queueActive && self.queueIndex < 0) {
+        // The pre-queue item finished and the appended queue takes over natively.
+        [self queueMovedForward];
         return;
     }
     [self emit:@"ended" payload:@{}];
