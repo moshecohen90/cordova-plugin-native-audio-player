@@ -20,6 +20,8 @@
 @property (nonatomic) BOOL looping;
 @property (nonatomic, strong) AVPlayerItem *observedItem;
 @property (nonatomic) BOOL interruptionRegistered;
+// The app-level intent: should audio be playing right now? Drives background recovery.
+@property (nonatomic) BOOL shouldBePlaying;
 // Native queue (background verse-to-verse continuity with zero JS).
 @property (nonatomic, strong) NSMutableArray<NSDictionary*> *queueMeta;   // FULL caller array
 @property (nonatomic, strong) NSMutableArray<NSNumber*> *queueAbsIndex;   // player order -> abs index
@@ -80,6 +82,7 @@
                                                object:item];
 
     BOOL autoplay = opts[@"autoplay"] ? [opts[@"autoplay"] boolValue] : YES;
+    self.shouldBePlaying = autoplay;
     if (autoplay) { [self.player play]; }
     // Set Now Playing AFTER starting so the OS sees a non-zero playback rate and
     // designates us the active Now Playing app (needed for the Control Center card).
@@ -143,6 +146,7 @@
     if (startPosMs > 0) {
         [self.player seekToTime:CMTimeMakeWithSeconds(startPosMs / 1000.0, NSEC_PER_SEC)];
     }
+    self.shouldBePlaying = YES;
     [self.player play];
     [self updateNowPlayingInfo:[self currentQueueMeta]];
     [self updateNowPlayingElapsed];
@@ -180,6 +184,7 @@
     self.queueIndex++;
     if (self.queueIndex >= (NSInteger)self.queueAbsIndex.count) {
         self.queueActive = NO;
+        self.shouldBePlaying = NO;
         [self emit:@"ended" payload:@{ @"queue": @YES }];
         return;
     }
@@ -232,6 +237,7 @@
                                                  name:AVPlayerItemDidPlayToEndTimeNotification
                                                object:item];
 
+    self.shouldBePlaying = YES;
     [self.player play];
     [self updateNowPlayingInfo:opts];
     [self updateNowPlayingElapsed];
@@ -240,16 +246,19 @@
 }
 
 - (void)play:(CDVInvokedUrlCommand*)command {
+    self.shouldBePlaying = YES;
     if (self.player) { [self.player play]; [self emitState]; }
     [self ok:command];
 }
 
 - (void)pause:(CDVInvokedUrlCommand*)command {
+    self.shouldBePlaying = NO;
     if (self.player) { [self.player pause]; [self emitState]; }
     [self ok:command];
 }
 
 - (void)stop:(CDVInvokedUrlCommand*)command {
+    self.shouldBePlaying = NO;
     self.looping = NO;
     [self teardownPlayer];
     [[MPNowPlayingInfoCenter defaultCenter] setNowPlayingInfo:nil];
@@ -293,6 +302,13 @@
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(sessionInterrupted:)
                                                      name:AVAudioSessionInterruptionNotification
+                                                   object:nil];
+        // WKWebView silently re-flips the SHARED AVAudioSession category under us, so at
+        // background-entry the media system can consider the app non-entitled and post a
+        // Pause. Re-assert the session on every background entry (we still have runtime).
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(appEnteredBackground:)
+                                                     name:UIApplicationDidEnterBackgroundNotification
                                                    object:nil];
     }
     AVAudioSession *s = [AVAudioSession sharedInstance];
@@ -338,9 +354,12 @@
     MPRemoteCommandCenter *c = [MPRemoteCommandCenter sharedCommandCenter];
     __weak NativeAudioPlayer *weakSelf = self;
     [c.playCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) {
+        weakSelf.shouldBePlaying = YES;
         [weakSelf.player play]; [weakSelf emitControl:@"play"]; return MPRemoteCommandHandlerStatusSuccess; }];
     [c.pauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) {
-        [weakSelf.player pause]; [weakSelf emitControl:@"pause"]; return MPRemoteCommandHandlerStatusSuccess; }];
+        weakSelf.shouldBePlaying = NO;
+        [weakSelf.player pause]; [weakSelf updateNowPlayingElapsed];
+        [weakSelf emitControl:@"pause"]; return MPRemoteCommandHandlerStatusSuccess; }];
     [c.nextTrackCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) {
         NativeAudioPlayer *s = weakSelf;
         if (s.queueActive && [s.player isKindOfClass:[AVQueuePlayer class]]) {
@@ -420,10 +439,36 @@
 
 - (void)sessionInterrupted:(NSNotification*)n {
     NSUInteger type = [n.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
-    if (type == AVAudioSessionInterruptionTypeBegan) {
-        [self.player pause];
-        [self emitControl:@"pause"];
+    if (type != AVAudioSessionInterruptionTypeBegan) { return; }
+    // Backgrounding "interruption": iOS pauses us because WKWebView flipped the shared
+    // session's category out from under our Playback config. If we SHOULD be playing,
+    // re-assert the session and resume on the spot — a real interruption (phone call)
+    // fails session activation here and falls through to the pause path.
+    if (self.shouldBePlaying && self.player != nil &&
+        [UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
+        AVAudioSession *s = [AVAudioSession sharedInstance];
+        NSError *catErr = nil; NSError *actErr = nil;
+        [s setCategory:AVAudioSessionCategoryPlayback mode:AVAudioSessionModeDefault options:0 error:&catErr];
+        [s setActive:YES error:&actErr];
+        if (actErr == nil) {
+            [self.player play];
+            NSLog(@"[NativeAudioPlayer] background interruption -> session re-asserted, playback resumed");
+            return;
+        }
+        NSLog(@"[NativeAudioPlayer] background interruption -> session reactivation FAILED: %@", actErr);
     }
+    [self.player pause];
+    [self emitControl:@"pause"];
+}
+
+- (void)appEnteredBackground:(NSNotification*)n {
+    if (!self.shouldBePlaying || self.player == nil) { return; }
+    AVAudioSession *s = [AVAudioSession sharedInstance];
+    NSError *actErr = nil;
+    [s setCategory:AVAudioSessionCategoryPlayback mode:AVAudioSessionModeDefault options:0 error:nil];
+    [s setActive:YES error:&actErr];
+    if (self.player.rate == 0) { [self.player play]; }
+    NSLog(@"[NativeAudioPlayer] entered background: session re-asserted (actErr=%@) rate=%f", actErr, self.player.rate);
 }
 
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
