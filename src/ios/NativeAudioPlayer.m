@@ -22,6 +22,13 @@
 @property (nonatomic) BOOL interruptionRegistered;
 // The app-level intent: should audio be playing right now? Drives background recovery.
 @property (nonatomic) BOOL shouldBePlaying;
+// Requested playback rate (setRate) — must be re-applied after every queue advance:
+// AVPlayer's play resets the rate, which would silently drop x2 back to x1 mid-queue.
+@property (nonatomic) float requestedRate;
+// Keeps the process alive while AVPlayer buffers in the background: a buffering gap plays
+// no audio, and with a silent audio session iOS suspends the app within seconds — freezing
+// the download forever. A background task buys ~30s per gap, plenty for a verse MP3.
+@property (nonatomic) UIBackgroundTaskIdentifier bufferKeepAlive;
 // Native queue (background verse-to-verse continuity with zero JS).
 @property (nonatomic, strong) NSMutableArray<NSDictionary*> *queueMeta;   // FULL caller array
 @property (nonatomic, strong) NSMutableArray<NSNumber*> *queueAbsIndex;   // player order -> abs index
@@ -31,6 +38,10 @@
 @end
 
 @implementation NativeAudioPlayer
+
+- (void)pluginInitialize {
+    self.bufferKeepAlive = UIBackgroundTaskInvalid;
+}
 
 - (void)startEvents:(CDVInvokedUrlCommand*)command {
     self.eventsCallbackId = command.callbackId;
@@ -121,6 +132,11 @@
 
     self.queueIndex = 0;
     self.queueActive = YES;
+    // Keep automaticallyWaitsToMinimizeStalling at its default (YES): per Apple, with NO an
+    // empty buffer resets the rate to 0 and playback NEVER self-recovers — exactly the
+    // "background playback wedges when the next verse needs the network" bug. With YES the
+    // player parks on WaitingToPlayAtSpecifiedRate and resumes by itself; we just keep the
+    // process alive through the silent gap (see beginBufferKeepAlive).
     self.player = [AVQueuePlayer queuePlayerWithItems:playerItems];
     [self setupTimeObserver];
     [self setupRemoteCommands];
@@ -158,7 +174,25 @@
 // index, refresh the Now Playing card, and tell JS (which may be frozen — that's fine).
 - (void)queueItemDidEnd:(NSNotification*)n {
     if (!self.queueActive) { return; }
-    [self queueMovedForward];
+    [self queueAdvanceAfter:(AVPlayerItem *)n.object];
+}
+
+// A CLIPPED item (forwardPlaybackEndTime) fires DidPlayToEnd but does NOT auto-advance
+// an AVQueuePlayer — the queue just stops there. Advance manually, restore the playback
+// rate (play resets it to 1), and keep the session alive.
+- (void)queueAdvanceAfter:(AVPlayerItem *)ended {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self.queueActive) { return; }
+        if ([self.player isKindOfClass:[AVQueuePlayer class]] && self.player.currentItem == ended) {
+            [(AVQueuePlayer *)self.player advanceToNextItem];
+        }
+        [self.player play];
+        if (self.requestedRate > 0 && self.requestedRate != 1) {
+            self.player.rate = self.requestedRate;
+        }
+        [self queueMovedForward];
+        NSLog(@"[NativeAudioPlayer] queue advanced -> index %ld (rate=%f)", (long)self.queueIndex, self.player.rate);
+    });
 }
 
 - (void)queueMovedForward {
@@ -166,6 +200,7 @@
     if (self.queueIndex >= (NSInteger)self.queueAbsIndex.count) {
         self.queueActive = NO;
         self.shouldBePlaying = NO;
+        [self endBufferKeepAlive];
         [self emit:@"ended" payload:@{ @"queue": @YES }];
         return;
     }
@@ -293,6 +328,7 @@
 
 - (void)pause:(CDVInvokedUrlCommand*)command {
     self.shouldBePlaying = NO;
+    [self endBufferKeepAlive];
     if (self.player) { [self.player pause]; [self emitState]; }
     [self ok:command];
 }
@@ -316,6 +352,7 @@
 
 - (void)setRate:(CDVInvokedUrlCommand*)command {
     float rate = [[command argumentAtIndex:0 withDefault:@1] floatValue];
+    self.requestedRate = rate;
     if (self.player && self.player.rate != 0) { self.player.rate = rate; }
     [self ok:command];
 }
@@ -350,6 +387,12 @@
                                                  selector:@selector(appEnteredBackground:)
                                                      name:UIApplicationDidEnterBackgroundNotification
                                                    object:nil];
+        // The current item ran out of buffered data (streaming verse in the background).
+        // With waits=YES the player recovers on its own; we just have to survive the gap.
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(playbackStalled:)
+                                                     name:AVPlayerItemPlaybackStalledNotification
+                                                   object:nil];
     }
     AVAudioSession *s = [AVAudioSession sharedInstance];
     NSError *catErr = nil;
@@ -368,6 +411,10 @@
 }
 
 - (void)setupTimeObserver {
+    // Track buffering: WaitingToPlayAtSpecifiedRate means the player is silent while it
+    // loads — hold a background task so iOS doesn't suspend us mid-download.
+    [self.player addObserver:self forKeyPath:@"timeControlStatus"
+                     options:NSKeyValueObservingOptionNew context:nil];
     __weak NativeAudioPlayer *weakSelf = self;
     self.timeObserver = [self.player addPeriodicTimeObserverForInterval:CMTimeMakeWithSeconds(0.1, NSEC_PER_SEC)
                                                                   queue:dispatch_get_main_queue()
@@ -469,8 +516,9 @@
         return;
     }
     if (self.queueActive && self.queueIndex < 0) {
-        // The pre-queue item finished and the appended queue takes over natively.
-        [self queueMovedForward];
+        // The pre-queue item finished; advance into the appended queue (a clipped item
+        // does not auto-advance the AVQueuePlayer).
+        [self queueAdvanceAfter:(AVPlayerItem *)n.object];
         return;
     }
     [self emit:@"ended" payload:@{}];
@@ -513,10 +561,61 @@
     [s setCategory:AVAudioSessionCategoryPlayback mode:AVAudioSessionModeDefault options:0 error:nil];
     [s setActive:YES error:&actErr];
     if (self.player.rate == 0) { [self.player play]; }
-    NSLog(@"[NativeAudioPlayer] entered background: session re-asserted (actErr=%@) rate=%f", actErr, self.player.rate);
+    // Already buffering at background-entry: no timeControl change will fire, so make sure
+    // the keep-alive is held right now.
+    if (self.player.timeControlStatus != AVPlayerTimeControlStatusPlaying) { [self beginBufferKeepAlive]; }
+    NSLog(@"[NativeAudioPlayer] entered background: session re-asserted (actErr=%@) rate=%f timeControl=%ld",
+          actErr, self.player.rate, (long)self.player.timeControlStatus);
+}
+
+// Buffering keep-alive: while the player is loading (silent), iOS sees no audio and can
+// suspend the app; a named background task keeps the process (and the download) running.
+- (void)beginBufferKeepAlive {
+    if (self.bufferKeepAlive != UIBackgroundTaskInvalid) { return; }
+    __weak NativeAudioPlayer *weakSelf = self;
+    self.bufferKeepAlive = [[UIApplication sharedApplication]
+        beginBackgroundTaskWithName:@"audio-buffering"
+                  expirationHandler:^{ [weakSelf endBufferKeepAlive]; }];
+    NSLog(@"[NativeAudioPlayer] buffering keep-alive begun");
+}
+
+- (void)endBufferKeepAlive {
+    if (self.bufferKeepAlive == UIBackgroundTaskInvalid) { return; }
+    [[UIApplication sharedApplication] endBackgroundTask:self.bufferKeepAlive];
+    self.bufferKeepAlive = UIBackgroundTaskInvalid;
+}
+
+- (void)timeControlChanged {
+    if (self.player == nil) { return; }
+    AVPlayerTimeControlStatus st = self.player.timeControlStatus;
+    if (st == AVPlayerTimeControlStatusPlaying) {
+        [self endBufferKeepAlive];
+        return;
+    }
+    if (!self.shouldBePlaying) { return; }
+    [self beginBufferKeepAlive];
+    if (st == AVPlayerTimeControlStatusPaused && self.player.currentItem != nil) {
+        // An intentionally playing player should never park on Paused (waits=YES buffers on
+        // Waiting instead) — this is the stall-reset path, kick playback back on.
+        NSLog(@"[NativeAudioPlayer] timeControl Paused while shouldBePlaying -> re-play");
+        [self.player play];
+    }
+}
+
+- (void)playbackStalled:(NSNotification*)n {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self.shouldBePlaying || self.player == nil) { return; }
+        NSLog(@"[NativeAudioPlayer] playback stalled (timeControl=%ld) -> keep-alive", (long)self.player.timeControlStatus);
+        [self beginBufferKeepAlive];
+        if (self.player.timeControlStatus == AVPlayerTimeControlStatusPaused) { [self.player play]; }
+    });
 }
 
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
+    if ([keyPath isEqualToString:@"timeControlStatus"] && object == self.player) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self timeControlChanged]; });
+        return;
+    }
     if ([keyPath isEqualToString:@"status"] && object == self.observedItem) {
         AVPlayerItem *item = (AVPlayerItem *)object;
         if (item.status == AVPlayerItemStatusFailed) {
@@ -576,7 +675,12 @@
         @try { [self.observedItem removeObserver:self forKeyPath:@"status"]; } @catch (NSException *ex) { /* not registered */ }
         self.observedItem = nil;
     }
-    if (self.player) { [self.player pause]; self.player = nil; }
+    if (self.player) {
+        @try { [self.player removeObserver:self forKeyPath:@"timeControlStatus"]; } @catch (NSException *ex) { /* not registered */ }
+        [self.player pause];
+        self.player = nil;
+    }
+    [self endBufferKeepAlive];
 }
 
 - (void)emitState {
