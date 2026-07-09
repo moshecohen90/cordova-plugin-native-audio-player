@@ -331,6 +331,8 @@ public class NativeAudioPlayer extends CordovaPlugin {
       public void onPrevious() { emit("control", controlPayload("previous")); }
       @Override
       public void onPause() { emit("control", controlPayload("pause")); }
+      @Override
+      public void onPlay() { emit("control", controlPayload("play")); }
     });
   }
 

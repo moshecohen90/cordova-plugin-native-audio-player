@@ -28,6 +28,7 @@ public class PlaybackService extends MediaSessionService {
     void onNext();
     void onPrevious();
     void onPause();
+    void onPlay();
   }
   private static NavListener navListener = null;
   public static void setNavListener(NavListener l) { navListener = l; }
@@ -108,6 +109,18 @@ public class PlaybackService extends MediaSessionService {
           navListener.onPause();
         }
         super.pause();
+      }
+
+      // Resuming a PAUSED-mid-track player (notification play button) — tell the app so
+      // its toolbar leaves the paused state. Fresh loads start from IDLE/BUFFERING, so
+      // they don't trigger this.
+      @Override
+      public void play() {
+        boolean resumingPaused = !getPlayWhenReady() && getPlaybackState() == Player.STATE_READY;
+        super.play();
+        if (resumingPaused && navListener != null) {
+          navListener.onPlay();
+        }
       }
 
       @Override
