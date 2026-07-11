@@ -197,12 +197,22 @@ public class NativeAudioPlayer extends CordovaPlugin {
     if (controller == null) { cb.error("not ready"); return; }
     try {
       JSONObject r = new JSONObject();
-      r.put("positionMs", controller.getCurrentPosition());
+      r.put("positionMs", realPositionMs());
       r.put("durationMs", controller.getDuration());
       cb.success(r);
     } catch (JSONException e) {
       cb.error(e.getMessage());
     }
+  }
+
+  /**
+   * Position from the REAL player (same process) when available: the MediaController's
+   * extrapolated position can freeze mid-item (observed on Android 16), which stalls the
+   * JS word-highlighting for the rest of the verse while audio keeps playing.
+   */
+  private long realPositionMs() {
+    long fromService = PlaybackService.currentPositionMs();
+    return fromService >= 0 ? fromService : controller.getCurrentPosition();
   }
 
   private MediaItem buildItem(JSONObject o) {
@@ -288,7 +298,7 @@ public class NativeAudioPlayer extends CordovaPlugin {
         if (controller != null && controller.isPlaying()) {
           JSONObject o = new JSONObject();
           try {
-            o.put("positionMs", controller.getCurrentPosition());
+            o.put("positionMs", realPositionMs());
             o.put("durationMs", controller.getDuration());
             o.put("index", controller.getCurrentMediaItemIndex());
             MediaItem cur = controller.getCurrentMediaItem();

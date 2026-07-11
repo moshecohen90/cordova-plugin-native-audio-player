@@ -33,9 +33,28 @@ public class PlaybackService extends MediaSessionService {
   private static NavListener navListener = null;
   public static void setNavListener(NavListener l) { navListener = l; }
 
+  // Same-process handle for reading the REAL player position. The plugin's
+  // MediaController.getCurrentPosition() is an extrapolated estimate that can freeze
+  // mid-item (seen on Android 16), which stalls JS word-highlighting for the rest of
+  // the verse while the audio keeps playing.
+  private static PlaybackService instance = null;
+
+  /** Actual player position in ms, or -1 when the service/player is unavailable.
+   *  Must be called on the main thread (the player's application thread). */
+  public static long currentPositionMs() {
+    PlaybackService s = instance;
+    if (s == null || s.mediaSession == null) return -1;
+    try {
+      return s.mediaSession.getPlayer().getCurrentPosition();
+    } catch (Exception e) {
+      return -1;
+    }
+  }
+
   @Override
   public void onCreate() {
     super.onCreate();
+    instance = this;
     ExoPlayer player = new ExoPlayer.Builder(this)
         .setAudioAttributes(
             new AudioAttributes.Builder()
@@ -160,6 +179,7 @@ public class PlaybackService extends MediaSessionService {
 
   @Override
   public void onDestroy() {
+    instance = null;
     if (mediaSession != null) {
       mediaSession.getPlayer().release();
       mediaSession.release();
