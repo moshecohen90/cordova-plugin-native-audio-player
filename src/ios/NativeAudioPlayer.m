@@ -1,166 +1,921 @@
 #import "NativeAudioPlayer.h"
-#import <AVFoundation/AVFoundation.h>
 #import <MediaPlayer/MediaPlayer.h>
+#import <objc/runtime.h>
 
 /**
- * iOS side: AVPlayer for playback + MPNowPlayingInfoCenter / MPRemoteCommandCenter for the
- * native Now Playing card (lock screen + Control Center), the same UI Apple Music / Podcasts
- * use. UIBackgroundModes:audio (added by plugin.xml) keeps it playing in the background.
+ * iOS side: AVQueuePlayer + MPNowPlayingInfoCenter / MPRemoteCommandCenter — the same
+ * Now Playing card Apple Music uses. The queue advances natively (zero JS), so playback
+ * survives a frozen background WebView. Every event carries the queue generation plus a
+ * monotonic seq so JS can drop stale or duplicated deliveries. No periodic position
+ * events; Now Playing is updated only on item change / play / pause / seek / rate.
+ *
+ * Queue items are verse SEGMENTS; items flagged boundary=true start a verse. The remote
+ * next/previous commands seek by verse boundary natively.
  */
+
+static void *kAbsIndexKey = &kAbsIndexKey;
+static void *kCurrentItemCtx = &kCurrentItemCtx;
+static void *kTimeControlCtx = &kTimeControlCtx;
+static void *kItemStatusCtx = &kItemStatusCtx;
+
+static BOOL napAudit(void) {
+#ifdef DEBUG
+    return YES;
+#else
+    return NO;
+#endif
+}
+
+@interface NAPSynthJob : NSObject
+@property (nonatomic, strong) AVSpeechSynthesizer *synth;
+@property (nonatomic, strong) AVAudioFile *file;
+@property (nonatomic) long long frames;
+@property (nonatomic) double sampleRate;
+@property (nonatomic, strong) NSMutableArray *timestamps;
+@property (nonatomic, copy) NSString *callbackId;
+@property (nonatomic, copy) NSString *cafPath;
+@property (nonatomic, copy) NSString *sidecarPath;
+@property (nonatomic) BOOL finished;
+@end
+@implementation NAPSynthJob
+@end
+
 @interface NativeAudioPlayer ()
-@property (nonatomic, strong) AVPlayer *player;
-@property (nonatomic, strong) id timeObserver;
+@property (nonatomic, strong) AVQueuePlayer *player;
 @property (nonatomic, copy) NSString *eventsCallbackId;
-@property (nonatomic, strong) NSMutableDictionary *nowPlaying;
-@property (nonatomic) double clipDurationMs;
-// Seekbar length to REPORT without clipping (single-verse mode: the MP3's own duration
-// includes bogus trailing silence, but clipping would freeze the position at the boundary).
-@property (nonatomic) double displayDurationMs;
-@property (nonatomic) BOOL remoteCommandsRegistered;
-@property (nonatomic) BOOL looping;
-@property (nonatomic, strong) AVPlayerItem *observedItem;
-@property (nonatomic) BOOL interruptionRegistered;
-// The app-level intent: should audio be playing right now? Drives background recovery.
+@property (nonatomic) long long generation;
+@property (nonatomic) long long seq;
+@property (nonatomic, copy) NSString *lastState;
+@property (nonatomic, copy) NSString *lastReason;
+@property (nonatomic) NSInteger lastReportedIndex;
 @property (nonatomic) BOOL shouldBePlaying;
-// Requested playback rate (setRate) — must be re-applied after every queue advance:
-// AVPlayer's play resets the rate, which would silently drop x2 back to x1 mid-queue.
+@property (nonatomic, copy) NSString *pauseReason;
 @property (nonatomic) float requestedRate;
-// Keeps the process alive while AVPlayer buffers in the background: a buffering gap plays
-// no audio, and with a silent audio session iOS suspends the app within seconds — freezing
-// the download forever. A background task buys ~30s per gap, plenty for a verse MP3.
 @property (nonatomic) UIBackgroundTaskIdentifier bufferKeepAlive;
-// Native queue (background verse-to-verse continuity with zero JS).
-@property (nonatomic, strong) NSMutableArray<NSDictionary*> *queueMeta;   // FULL caller array
-@property (nonatomic, strong) NSMutableArray<NSNumber*> *queueAbsIndex;   // player order -> abs index
-@property (nonatomic, strong) NSMutableArray<AVPlayerItem*> *queueItems;  // observed player items
-@property (nonatomic) NSInteger queueIndex;                               // position in player order
-@property (nonatomic) BOOL queueActive;
+@property (nonatomic, strong) NSMutableArray<NSDictionary*> *queueMeta;
+@property (nonatomic, strong) NSMutableArray<AVPlayerItem*> *liveItems;
+@property (nonatomic, strong) NSMutableDictionary *nowPlaying;
+@property (nonatomic, copy) NSString *artworkUrl;
+@property (nonatomic, strong) MPMediaItemArtwork *artwork;
+@property (nonatomic) BOOL remoteCommandsRegistered;
+@property (nonatomic) BOOL sessionObserversRegistered;
+@property (nonatomic, strong) NSTimer *heartbeat;
+@property (nonatomic, strong) NSMapTable<AVSpeechUtterance*, NAPSynthJob*> *synthJobs;
+@property (nonatomic, strong) dispatch_queue_t synthQueue;
+@property (nonatomic) long long stallToken;
 @end
 
 @implementation NativeAudioPlayer
 
 - (void)pluginInitialize {
     self.bufferKeepAlive = UIBackgroundTaskInvalid;
+    self.requestedRate = 1.0f;
+    self.lastReportedIndex = -1;
+    self.synthJobs = [NSMapTable strongToStrongObjectsMapTable];
+    self.synthQueue = dispatch_queue_create("nap.synth", DISPATCH_QUEUE_SERIAL);
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(itemDidEnd:)
+        name:AVPlayerItemDidPlayToEndTimeNotification object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(itemFailed:)
+        name:AVPlayerItemFailedToPlayToEndTimeNotification object:nil];
+    [self registerTestCommandObservers];
 }
 
-- (void)startEvents:(CDVInvokedUrlCommand*)command {
+// Debug-only automation channel: `devicectl device notification post --name nap.test.<cmd>`
+// reaches the RUNNING app without relaunching it (devicectl can otherwise deliver a URL
+// only by relaunching, which kills the console stream and any active playback).
+- (void)registerTestCommandObservers {
+    if (!napAudit()) { return; }
+    CFNotificationCenterRef center = CFNotificationCenterGetDarwinNotifyCenter();
+    for (NSString *cmd in @[@"cfg.mp3", @"cfg.tts", @"cfg.mp3tts", @"cfg.mixed", @"play", @"play.start", @"stop"]) {
+        CFNotificationCenterAddObserver(center, (__bridge const void *)self, napTestCommandCallback,
+            (__bridge CFStringRef)[@"nap.test." stringByAppendingString:cmd], NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+    }
+}
+
+static void napTestCommandCallback(CFNotificationCenterRef center, void *observer, CFNotificationName name, const void *object, CFDictionaryRef userInfo) {
+    NativeAudioPlayer *plugin = (__bridge NativeAudioPlayer *)observer;
+    NSString *command = [(__bridge NSString *)name stringByReplacingOccurrencesOfString:@"nap.test." withString:@""];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [plugin emit:@"test" payload:@{ @"command": command }];
+    });
+}
+
+#pragma mark - commands
+
+- (void)setEvents:(CDVInvokedUrlCommand*)command {
     self.eventsCallbackId = command.callbackId;
     CDVPluginResult *r = [CDVPluginResult resultWithStatus:CDVCommandStatus_NO_RESULT];
     [r setKeepCallbackAsBool:YES];
     [self.commandDelegate sendPluginResult:r callbackId:command.callbackId];
 }
 
-- (void)load:(CDVInvokedUrlCommand*)command {
-    NSDictionary *opts = [command argumentAtIndex:0 withDefault:@{}];
-    NSString *url = opts[@"url"];
-    if (url == nil || url.length == 0) { [self fail:command msg:@"missing url"]; return; }
-
-    NSLog(@"[NativeAudioPlayer] load url=%@ title=%@", url, opts[@"title"]);
-    NSURL *u = [self urlFromString:url];
-    if (u == nil) { [self fail:command msg:@"invalid url"]; return; }
-    [self configureSession];
-    [self teardownPlayer];
-    self.looping = NO;
-
-    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:u];
-    // High-quality time-stretch for speech. AVPlayer's default (TimeDomain / low-quality)
-    // sounds thin and robotic on voice at non-1x speeds, whereas Android's ExoPlayer uses the
-    // high-quality Sonic algorithm by default — which is why the same verse MP3 sounds good on
-    // Android but bad on iOS. Spectral is the best-quality algorithm and is bypassed at rate 1.0.
-    item.audioTimePitchAlgorithm = AVAudioTimePitchAlgorithmSpectral;
-    // Clip to the real speech length so the Now Playing seekbar/duration is correct
-    // (the MP3's own duration is unreliable) and playback ends without trailing silence.
-    self.clipDurationMs = [[opts objectForKey:@"durationMs"] doubleValue];
-    if (self.clipDurationMs > 0) {
-        item.forwardPlaybackEndTime = CMTimeMakeWithSeconds(self.clipDurationMs / 1000.0, NSEC_PER_SEC);
-    }
-    self.displayDurationMs = [[opts objectForKey:@"displayDurationMs"] doubleValue];
-    // AVQueuePlayer from the start: a background handoff can then APPEND upcoming verses
-    // after this one with zero interruption (an AVPlayer can't be upgraded in place).
-    self.player = [AVQueuePlayer queuePlayerWithItems:@[item]];
-    [self setupTimeObserver];
-    [self setupRemoteCommands];
-
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(itemDidEnd:)
-                                                 name:AVPlayerItemDidPlayToEndTimeNotification
-                                               object:item];
-    // Surface load/decode failures to JS — without this a bad source (404 MP3 etc.)
-    // leaves the app's verse promise pending forever and playback freezes.
-    [item addObserver:self forKeyPath:@"status" options:NSKeyValueObservingOptionNew context:nil];
-    self.observedItem = item;
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(itemFailed:)
-                                                 name:AVPlayerItemFailedToPlayToEndTimeNotification
-                                               object:item];
-
-    BOOL autoplay = opts[@"autoplay"] ? [opts[@"autoplay"] boolValue] : YES;
-    self.shouldBePlaying = autoplay;
-    if (autoplay) { [self.player play]; }
-    // Set Now Playing AFTER starting so the OS sees a non-zero playback rate and
-    // designates us the active Now Playing app (needed for the Control Center card).
-    [self updateNowPlayingInfo:opts];
-    [self updateNowPlayingElapsed];
-    [self emitState];
-    [self ok:command];
-}
-
-// Native playlist via AVQueuePlayer: verse-to-verse advancing happens entirely in the OS,
-// so playback continues in the background even when the WebView's JS is frozen.
 - (void)setQueue:(CDVInvokedUrlCommand*)command {
-    NSArray *items = [command argumentAtIndex:0 withDefault:@[]];
-    NSInteger start = [[command argumentAtIndex:1 withDefault:@0] integerValue];
-    double startPosMs = [[command argumentAtIndex:2 withDefault:@0] doubleValue];
-    if (items.count == 0) { [self fail:command msg:@"empty queue"]; return; }
-    if (start < 0 || start >= (NSInteger)items.count) { start = 0; }
+    NSDictionary *opts = [command argumentAtIndex:0 withDefault:@{}];
+    NSArray *items = opts[@"items"];
+    if (![items isKindOfClass:[NSArray class]] || items.count == 0) { [self fail:command msg:@"empty queue"]; return; }
 
     [self configureSession];
-    [self teardownPlayer];
-    self.looping = NO;
-    self.clipDurationMs = 0;
-    self.queueMeta = [items mutableCopy];       // FULL array: transition indices stay
-    self.queueAbsIndex = [NSMutableArray array]; // absolute (matching Android + the JS contract)
-    self.queueItems = [NSMutableArray array];
+    [self teardownPlayback];
+    self.generation = [opts[@"generation"] longLongValue];
+    self.lastState = nil;
+    self.lastReason = nil;
+    self.pauseReason = nil;
+    self.queueMeta = [items mutableCopy];
+    double rate = [opts[@"rate"] doubleValue];
+    self.requestedRate = rate > 0 ? (float)rate : 1.0f;
 
-    NSMutableArray<AVPlayerItem*> *playerItems = [NSMutableArray array];
-    for (NSInteger i = start; i < (NSInteger)items.count; i++) {
-        AVPlayerItem *item = [self buildQueueItemFrom:items[i] absIndex:i];
-        if (item == nil) { continue; }
-        [playerItems addObject:item];
-    }
-    if (playerItems.count == 0) { [self fail:command msg:@"no valid items"]; return; }
+    NSInteger start = [opts[@"startIndex"] integerValue];
+    if (start < 0 || start >= (NSInteger)items.count) { start = 0; }
+    NSArray<AVPlayerItem*> *built = [self buildItemsFromAbs:start];
+    if (built.count == 0) { [self fail:command msg:@"no valid items"]; return; }
 
-    self.queueIndex = 0;
-    self.queueActive = YES;
-    // Keep automaticallyWaitsToMinimizeStalling at its default (YES): per Apple, with NO an
-    // empty buffer resets the rate to 0 and playback NEVER self-recovers — exactly the
-    // "background playback wedges when the next verse needs the network" bug. With YES the
-    // player parks on WaitingToPlayAtSpecifiedRate and resumes by itself; we just keep the
-    // process alive through the silent gap (see beginBufferKeepAlive).
-    self.player = [AVQueuePlayer queuePlayerWithItems:playerItems];
-    [self setupTimeObserver];
-    [self setupRemoteCommands];
+    self.player = [AVQueuePlayer queuePlayerWithItems:built];
+    [self.player addObserver:self forKeyPath:@"currentItem"
+                     options:NSKeyValueObservingOptionNew | NSKeyValueObservingOptionInitial
+                     context:kCurrentItemCtx];
+    [self.player addObserver:self forKeyPath:@"timeControlStatus"
+                     options:NSKeyValueObservingOptionNew context:kTimeControlCtx];
+
+    double startPosMs = [opts[@"startPositionMs"] doubleValue];
     if (startPosMs > 0) {
         [self.player seekToTime:CMTimeMakeWithSeconds(startPosMs / 1000.0, NSEC_PER_SEC)];
     }
-    self.shouldBePlaying = YES;
-    [self.player play];
-    [self updateNowPlayingInfo:[self currentQueueMeta]];
-    [self updateNowPlayingElapsed];
-    [self emitState];
+    BOOL autoplay = opts[@"autoplay"] ? [opts[@"autoplay"] boolValue] : YES;
+    self.shouldBePlaying = autoplay;
+    if (autoplay) { [self applyPlay]; }
+    [self startHeartbeat];
     [self ok:command];
 }
 
-/** Meta of the currently playing queue item (player order -> absolute index). */
-- (NSDictionary *)currentQueueMeta {
-    if (!self.queueActive || self.queueIndex < 0 || self.queueIndex >= (NSInteger)self.queueAbsIndex.count) { return @{}; }
-    NSInteger abs = [self.queueAbsIndex[self.queueIndex] integerValue];
-    return abs < (NSInteger)self.queueMeta.count ? self.queueMeta[abs] : @{};
+- (void)appendQueue:(CDVInvokedUrlCommand*)command {
+    NSDictionary *opts = [command argumentAtIndex:0 withDefault:@{}];
+    NSArray *items = opts[@"items"];
+    if (![items isKindOfClass:[NSArray class]] || items.count == 0) { [self fail:command msg:@"empty items"]; return; }
+    if ([opts[@"generation"] longLongValue] != self.generation) { [self fail:command msg:@"stale generation"]; return; }
+    if (self.player == nil || self.queueMeta == nil) { [self fail:command msg:@"no active queue"]; return; }
+
+    NSInteger firstAbs = self.queueMeta.count;
+    [self.queueMeta addObjectsFromArray:items];
+    AVPlayerItem *after = self.player.items.lastObject;
+    NSInteger appended = 0;
+    for (NSInteger i = 0; i < (NSInteger)items.count; i++) {
+        AVPlayerItem *item = [self buildItemFrom:items[i] absIndex:firstAbs + i];
+        if (item == nil) { continue; }
+        [self.liveItems addObject:item];
+        if ([self.player canInsertItem:item afterItem:after]) {
+            [self.player insertItem:item afterItem:after];
+            after = item;
+            appended++;
+        }
+    }
+    if (appended == 0) { [self fail:command msg:@"nothing appended"]; return; }
+    [self ok:command];
 }
 
-/** Parse a URL string, percent-encoding as a fallback (raw Hebrew/space paths crash AVPlayerItem). */
+- (void)play:(CDVInvokedUrlCommand*)command {
+    self.shouldBePlaying = YES;
+    [self configureSession];
+    [self applyPlay];
+    [self ok:command];
+}
+
+- (void)pause:(CDVInvokedUrlCommand*)command {
+    [self pauseWithReason:@"user"];
+    [self ok:command];
+}
+
+- (void)stop:(CDVInvokedUrlCommand*)command {
+    self.shouldBePlaying = NO;
+    self.pauseReason = nil;
+    [self teardownPlayback];
+    self.queueMeta = nil;
+    [[MPNowPlayingInfoCenter defaultCenter] setNowPlayingInfo:nil];
+    [self maybeEmitState];
+    [self ok:command];
+}
+
+- (void)seekToItem:(CDVInvokedUrlCommand*)command {
+    NSDictionary *opts = [command argumentAtIndex:0 withDefault:@{}];
+    NSInteger index = [opts[@"index"] integerValue];
+    double posMs = [opts[@"positionMs"] doubleValue];
+    if (self.player == nil || self.queueMeta == nil) { [self fail:command msg:@"no active queue"]; return; }
+    if (index < 0 || index >= (NSInteger)self.queueMeta.count) { [self fail:command msg:@"index out of range"]; return; }
+    if (index == self.lastReportedIndex) {
+        [self.player seekToTime:CMTimeMakeWithSeconds(posMs / 1000.0, NSEC_PER_SEC)];
+        [self refreshNowPlayingPlayback];
+    } else if (index > self.lastReportedIndex) {
+        [self jumpForwardToAbs:index];
+        if (posMs > 0) { [self.player seekToTime:CMTimeMakeWithSeconds(posMs / 1000.0, NSEC_PER_SEC)]; }
+    } else {
+        [self rebuildFromAbs:index positionMs:posMs];
+    }
+    [self ok:command];
+}
+
+- (void)setRate:(CDVInvokedUrlCommand*)command {
+    float rate = [[command argumentAtIndex:0 withDefault:@1] floatValue];
+    self.requestedRate = rate > 0 ? rate : 1.0f;
+    if (self.player && self.player.rate != 0) {
+        self.player.rate = self.requestedRate;
+        [self refreshNowPlayingPlayback];
+    }
+    [self ok:command];
+}
+
+- (void)getState:(CDVInvokedUrlCommand*)command {
+    NSMutableDictionary *r = [NSMutableDictionary dictionary];
+    r[@"generation"] = @(self.generation);
+    r[@"state"] = [self computeState];
+    NSString *reason = [self computeReason];
+    if (reason) { r[@"reason"] = reason; }
+    r[@"index"] = @(self.lastReportedIndex);
+    NSDictionary *meta = [self metaAtAbs:self.lastReportedIndex];
+    r[@"id"] = meta[@"id"] ?: @"";
+    r[@"positionMs"] = @([self positionMs]);
+    r[@"durationMs"] = @([self durationMs]);
+    r[@"rate"] = @(self.player ? self.player.rate : 0);
+    [self.commandDelegate sendPluginResult:[CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:r]
+                                callbackId:command.callbackId];
+}
+
+#pragma mark - queue internals
+
+- (NSArray<AVPlayerItem*> *)buildItemsFromAbs:(NSInteger)start {
+    NSMutableArray<AVPlayerItem*> *arr = [NSMutableArray array];
+    for (NSInteger i = start; i < (NSInteger)self.queueMeta.count; i++) {
+        AVPlayerItem *item = [self buildItemFrom:self.queueMeta[i] absIndex:i];
+        if (item != nil) { [arr addObject:item]; }
+    }
+    self.liveItems = arr;
+    return arr;
+}
+
+- (AVPlayerItem *)buildItemFrom:(NSDictionary *)o absIndex:(NSInteger)i {
+    NSURL *u = [self urlFromString:o[@"url"]];
+    if (u == nil) { return nil; }
+    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:u];
+    // High-quality time-stretch for speech: the default algorithm sounds thin and robotic
+    // on voice at non-1x speeds; Spectral is bypassed at rate 1.0 so it costs nothing.
+    item.audioTimePitchAlgorithm = AVAudioTimePitchAlgorithmSpectral;
+    double clip = [[o objectForKey:@"clipEndMs"] doubleValue];
+    if (clip > 0) {
+        item.forwardPlaybackEndTime = CMTimeMakeWithSeconds(clip / 1000.0, NSEC_PER_SEC);
+    }
+    objc_setAssociatedObject(item, kAbsIndexKey, @(i), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [item addObserver:self forKeyPath:@"status" options:NSKeyValueObservingOptionNew context:kItemStatusCtx];
+    return item;
+}
+
+- (NSInteger)absIndexOf:(AVPlayerItem *)item {
+    NSNumber *n = objc_getAssociatedObject(item, kAbsIndexKey);
+    return n != nil ? n.integerValue : -1;
+}
+
+- (NSDictionary *)metaAtAbs:(NSInteger)abs {
+    if (self.queueMeta == nil || abs < 0 || abs >= (NSInteger)self.queueMeta.count) { return @{}; }
+    return self.queueMeta[abs];
+}
+
+- (BOOL)isBoundaryAtAbs:(NSInteger)abs {
+    NSDictionary *meta = [self metaAtAbs:abs];
+    return meta[@"boundary"] == nil || [meta[@"boundary"] boolValue];
+}
+
+/** The single bookkeeping path for EVERY current-item change (auto-advance, manual
+ *  advance, skip, rebuild). Idempotent: repeated calls for the same item no-op. */
+- (void)syncAfterItemChange {
+    if (self.player == nil || self.queueMeta == nil) { return; }
+    AVPlayerItem *cur = self.player.currentItem;
+    if (cur == nil) {
+        self.shouldBePlaying = NO;
+        [self endBufferKeepAlive];
+        [self stopHeartbeat];
+        [self emit:@"ended" payload:@{}];
+        self.lastReportedIndex = -1;
+        [[MPNowPlayingInfoCenter defaultCenter] setNowPlayingInfo:nil];
+        [self maybeEmitState];
+        return;
+    }
+    NSInteger abs = [self absIndexOf:cur];
+    if (abs == self.lastReportedIndex) { return; }
+    self.lastReportedIndex = abs;
+    if (self.player.rate != 0 && fabsf(self.player.rate - self.requestedRate) > 0.01f) {
+        self.player.rate = self.requestedRate;
+    }
+    [self refreshNowPlayingItem];
+    NSDictionary *meta = [self metaAtAbs:abs];
+    [self emit:@"transition" payload:@{ @"index": @(abs),
+                                        @"id": meta[@"id"] ?: @"",
+                                        @"tag": meta[@"tag"] ?: @"" }];
+}
+
+// A CLIPPED item (forwardPlaybackEndTime) fires DidPlayToEnd but does NOT auto-advance
+// an AVQueuePlayer — advance manually. Non-clipped items auto-advance natively, in which
+// case currentItem already moved on and this handler must not advance again.
+- (void)itemDidEnd:(NSNotification*)n {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        AVPlayerItem *item = (AVPlayerItem *)n.object;
+        if (self.player == nil || ![self.liveItems containsObject:item]) { return; }
+        if (self.player.currentItem == item) {
+            [self.player advanceToNextItem];
+            if (self.shouldBePlaying) { [self applyPlay]; }
+        }
+        [self syncAfterItemChange];
+    });
+}
+
+// A queue item failed to stream (404, network drop): report and skip so background
+// playback continues instead of stalling silently.
+- (void)itemFailed:(NSNotification*)n {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        AVPlayerItem *item = (AVPlayerItem *)n.object;
+        if (self.player == nil || ![self.liveItems containsObject:item]) { return; }
+        NSError *e = n.userInfo[AVPlayerItemFailedToPlayToEndTimeErrorKey];
+        [self emitItemError:item code:@"queue_item_failed" message:e.localizedDescription];
+        [self skipFailedItem:item];
+    });
+}
+
+- (void)skipFailedItem:(AVPlayerItem *)item {
+    if (self.player.currentItem == item) {
+        [self.player advanceToNextItem];
+        if (self.shouldBePlaying) { [self applyPlay]; }
+        [self syncAfterItemChange];
+    }
+}
+
+- (void)jumpForwardToAbs:(NSInteger)target {
+    NSInteger guard = self.liveItems.count;
+    while (guard-- > 0 && self.player.currentItem != nil && [self absIndexOf:self.player.currentItem] < target) {
+        [self.player advanceToNextItem];
+    }
+    if (self.shouldBePlaying) { [self applyPlay]; }
+    [self syncAfterItemChange];
+}
+
+- (void)rebuildFromAbs:(NSInteger)abs positionMs:(double)posMs {
+    [self removeItemObservers];
+    NSArray<AVPlayerItem*> *built = [self buildItemsFromAbs:abs];
+    if (built.count == 0) { return; }
+    self.lastReportedIndex = -1;
+    [self.player removeAllItems];
+    AVPlayerItem *after = nil;
+    for (AVPlayerItem *item in built) {
+        if ([self.player canInsertItem:item afterItem:after]) {
+            [self.player insertItem:item afterItem:after];
+            after = item;
+        }
+    }
+    if (posMs > 0) {
+        [self.player seekToTime:CMTimeMakeWithSeconds(posMs / 1000.0, NSEC_PER_SEC)];
+    }
+    if (self.shouldBePlaying) { [self applyPlay]; }
+    [self syncAfterItemChange];
+}
+
+- (void)applyPlay {
+    self.pauseReason = nil;
+    self.player.rate = self.requestedRate;
+    [self refreshNowPlayingPlayback];
+}
+
+- (void)pauseWithReason:(NSString *)reason {
+    self.shouldBePlaying = NO;
+    self.pauseReason = reason;
+    [self endBufferKeepAlive];
+    [self.player pause];
+    [self refreshNowPlayingPlayback];
+}
+
+#pragma mark - remote commands
+
+- (void)setupRemoteCommands {
+    // Registered ONCE for the app lifetime — re-adding per queue would accumulate
+    // duplicate handlers and a single lock-screen press would fire N times.
+    if (self.remoteCommandsRegistered) { return; }
+    self.remoteCommandsRegistered = YES;
+    MPRemoteCommandCenter *c = [MPRemoteCommandCenter sharedCommandCenter];
+    __weak NativeAudioPlayer *weakSelf = self;
+    [c.playCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) {
+        NativeAudioPlayer *s = weakSelf;
+        s.shouldBePlaying = YES;
+        [s configureSession];
+        [s applyPlay];
+        [s auditControl:@"play"];
+        return MPRemoteCommandHandlerStatusSuccess;
+    }];
+    [c.pauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) {
+        [weakSelf pauseWithReason:@"user"];
+        [weakSelf auditControl:@"pause"];
+        return MPRemoteCommandHandlerStatusSuccess;
+    }];
+    [c.nextTrackCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) {
+        [weakSelf remoteNext];
+        return MPRemoteCommandHandlerStatusSuccess;
+    }];
+    [c.previousTrackCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) {
+        [weakSelf remotePrevious];
+        return MPRemoteCommandHandlerStatusSuccess;
+    }];
+    c.nextTrackCommand.enabled = YES;
+    c.previousTrackCommand.enabled = YES;
+    [c.changePlaybackPositionCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) {
+        MPChangePlaybackPositionCommandEvent *pe = (MPChangePlaybackPositionCommandEvent *)e;
+        [weakSelf.player seekToTime:CMTimeMakeWithSeconds(pe.positionTime, NSEC_PER_SEC)];
+        [weakSelf refreshNowPlayingPlayback];
+        return MPRemoteCommandHandlerStatusSuccess;
+    }];
+}
+
+- (void)remoteNext {
+    if (self.queueMeta == nil || self.lastReportedIndex < 0) { return; }
+    for (NSInteger i = self.lastReportedIndex + 1; i < (NSInteger)self.queueMeta.count; i++) {
+        if ([self isBoundaryAtAbs:i]) {
+            [self auditControl:@"next"];
+            [self jumpForwardToAbs:i];
+            return;
+        }
+    }
+}
+
+- (void)remotePrevious {
+    if (self.queueMeta == nil || self.lastReportedIndex < 0) { return; }
+    NSInteger verseStart = self.lastReportedIndex;
+    while (verseStart > 0 && ![self isBoundaryAtAbs:verseStart]) { verseStart--; }
+    NSInteger target = verseStart;
+    for (NSInteger i = verseStart - 1; i >= 0; i--) {
+        if ([self isBoundaryAtAbs:i]) { target = i; break; }
+    }
+    [self auditControl:@"previous"];
+    if (target == self.lastReportedIndex) {
+        [self.player seekToTime:kCMTimeZero];
+        [self refreshNowPlayingPlayback];
+    } else {
+        [self rebuildFromAbs:target positionMs:0];
+    }
+}
+
+#pragma mark - session / interruptions
+
+- (void)configureSession {
+    if (!self.sessionObserversRegistered) {
+        self.sessionObserversRegistered = YES;
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(sessionInterrupted:)
+                                                     name:AVAudioSessionInterruptionNotification
+                                                   object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(routeChanged:)
+                                                     name:AVAudioSessionRouteChangeNotification
+                                                   object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(appEnteredBackground:)
+                                                     name:UIApplicationDidEnterBackgroundNotification
+                                                   object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(playbackStalled:)
+                                                     name:AVPlayerItemPlaybackStalledNotification
+                                                   object:nil];
+    }
+    // Force Playback + Default mode with the full 3-arg form: the shared session may be
+    // left in PlayAndRecord / VoiceChat by the microphone, the TTS engine or the WebView,
+    // which routes audio to the earpiece with narrowband voice processing.
+    AVAudioSession *s = [AVAudioSession sharedInstance];
+    [s setCategory:AVAudioSessionCategoryPlayback mode:AVAudioSessionModeDefault options:0 error:nil];
+    [s setActive:YES error:nil];
+    [self setupRemoteCommands];
+}
+
+// The ONE interruption path: Began pauses and reports; Ended auto-resumes only when the
+// system says shouldResume and nothing else paused us in between.
+- (void)sessionInterrupted:(NSNotification*)n {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSUInteger type = [n.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
+        if (type == AVAudioSessionInterruptionTypeBegan) {
+            if (self.player == nil || self.player.currentItem == nil) { return; }
+            self.pauseReason = @"interruption";
+            [self.player pause];
+            [self maybeEmitState];
+            [self auditLog:@"interruptionBegan" json:@"{}"];
+            return;
+        }
+        NSUInteger opts = [n.userInfo[AVAudioSessionInterruptionOptionKey] unsignedIntegerValue];
+        BOOL resume = (opts & AVAudioSessionInterruptionOptionShouldResume) != 0
+            && self.shouldBePlaying
+            && [@"interruption" isEqualToString:self.pauseReason];
+        if (resume) {
+            AVAudioSession *s = [AVAudioSession sharedInstance];
+            [s setCategory:AVAudioSessionCategoryPlayback mode:AVAudioSessionModeDefault options:0 error:nil];
+            [s setActive:YES error:nil];
+            [self applyPlay];
+        }
+        [self auditLog:@"interruptionEnded" json:[NSString stringWithFormat:@"{\"resumed\":%@}", resume ? @"true" : @"false"]];
+    });
+}
+
+- (void)routeChanged:(NSNotification*)n {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSUInteger reason = [n.userInfo[AVAudioSessionRouteChangeReasonKey] unsignedIntegerValue];
+        if (reason != AVAudioSessionRouteChangeReasonOldDeviceUnavailable) { return; }
+        if (self.player == nil || self.player.rate == 0) { return; }
+        [self pauseWithReason:@"noisy"];
+        [self maybeEmitState];
+    });
+}
+
+// WKWebView flips the shared AVAudioSession at background entry even when it plays no
+// audio, which makes iOS pause the player (rate drops to 0 with no interruption
+// notification). Re-assert the session and resume immediately while we still have
+// runtime; the stall kick covers any later recurrence through the same single path.
+- (void)appEnteredBackground:(NSNotification*)n {
+    if (!self.shouldBePlaying || self.player == nil) { return; }
+    [self reassertSession];
+    if (self.player.rate == 0 && self.pauseReason == nil && self.player.currentItem != nil) {
+        self.player.rate = self.requestedRate;
+    }
+    if (self.player.timeControlStatus != AVPlayerTimeControlStatusPlaying) { [self beginBufferKeepAlive]; }
+}
+
+- (void)reassertSession {
+    AVAudioSession *s = [AVAudioSession sharedInstance];
+    [s setCategory:AVAudioSessionCategoryPlayback mode:AVAudioSessionModeDefault options:0 error:nil];
+    [s setActive:YES error:nil];
+}
+
+- (void)playbackStalled:(NSNotification*)n {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self.shouldBePlaying || self.player == nil) { return; }
+        if (![self.liveItems containsObject:(AVPlayerItem *)n.object]) { return; }
+        [self beginBufferKeepAlive];
+    });
+}
+
+// An intentionally playing player must never park on Paused (waits=YES buffers on
+// Waiting instead). The kick is DELAYED and re-verified: a real interruption silences
+// the player BEFORE its notification arrives, so an immediate kick would resume audio
+// mid-phone-call. After the delay the interruption reason is already set and aborts it.
+- (void)scheduleStallKick {
+    long long token = ++self.stallToken;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (token != self.stallToken || self.player == nil) { return; }
+        BOOL stillStalled = self.shouldBePlaying && self.pauseReason == nil
+            && self.player.currentItem != nil
+            && self.player.timeControlStatus == AVPlayerTimeControlStatusPaused;
+        if (stillStalled) {
+            [self auditLog:@"stallKick" json:@"{}"];
+            [self reassertSession];
+            self.player.rate = self.requestedRate;
+        }
+    });
+}
+
+// Keeps the process alive while AVPlayer buffers silently in the background: with no
+// audio playing iOS suspends the app within seconds, freezing the download forever.
+- (void)beginBufferKeepAlive {
+    if (self.bufferKeepAlive != UIBackgroundTaskInvalid) { return; }
+    __weak NativeAudioPlayer *weakSelf = self;
+    self.bufferKeepAlive = [[UIApplication sharedApplication]
+        beginBackgroundTaskWithName:@"audio-buffering"
+                  expirationHandler:^{ [weakSelf endBufferKeepAlive]; }];
+}
+
+- (void)endBufferKeepAlive {
+    if (self.bufferKeepAlive == UIBackgroundTaskInvalid) { return; }
+    [[UIApplication sharedApplication] endBackgroundTask:self.bufferKeepAlive];
+    self.bufferKeepAlive = UIBackgroundTaskInvalid;
+}
+
+#pragma mark - state & events
+
+- (NSString *)computeState {
+    if (self.player == nil || self.player.currentItem == nil) { return @"idle"; }
+    switch (self.player.timeControlStatus) {
+        case AVPlayerTimeControlStatusPlaying: return @"playing";
+        case AVPlayerTimeControlStatusWaitingToPlayAtSpecifiedRate: return @"buffering";
+        default: return @"paused";
+    }
+}
+
+- (NSString *)computeReason {
+    if (![[self computeState] isEqualToString:@"paused"]) { return nil; }
+    return self.pauseReason ?: @"user";
+}
+
+/** Emits a state event only when the normalized (state, reason) tuple changed. */
+- (void)maybeEmitState {
+    NSString *state = [self computeState];
+    NSString *reason = [self computeReason];
+    BOOL sameState = [state isEqualToString:self.lastState ?: @""];
+    BOOL sameReason = (reason == nil && self.lastReason == nil) || [reason isEqualToString:self.lastReason ?: @""];
+    if (sameState && sameReason) { return; }
+    self.lastState = state;
+    self.lastReason = reason;
+    NSMutableDictionary *p = [NSMutableDictionary dictionary];
+    p[@"state"] = state;
+    if (reason) { p[@"reason"] = reason; }
+    p[@"index"] = @(self.lastReportedIndex);
+    p[@"positionMs"] = @([self positionMs]);
+    p[@"rate"] = @(self.player ? self.player.rate : 0);
+    [self emit:@"state" payload:p];
+}
+
+- (void)emitItemError:(AVPlayerItem *)item code:(NSString *)code message:(NSString *)message {
+    [self emit:@"error" payload:@{ @"code": code,
+                                   @"message": message ?: @"playback error",
+                                   @"index": @([self absIndexOf:item]) }];
+}
+
+- (void)emit:(NSString*)type payload:(NSDictionary*)payload {
+    NSMutableDictionary *o = [payload mutableCopy] ?: [NSMutableDictionary dictionary];
+    o[@"type"] = type;
+    o[@"generation"] = @(self.generation);
+    o[@"seq"] = @(++self.seq);
+    if (napAudit()) {
+        NSData *d = [NSJSONSerialization dataWithJSONObject:o options:0 error:nil];
+        NSLog(@"[AUD] %@ %@", type, d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : @"{}");
+    }
+    if (self.eventsCallbackId == nil) { return; }
+    CDVPluginResult *r = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:o];
+    [r setKeepCallbackAsBool:YES];
+    [self.commandDelegate sendPluginResult:r callbackId:self.eventsCallbackId];
+}
+
+- (void)auditControl:(NSString *)action {
+    [self auditLog:@"control" json:[NSString stringWithFormat:@"{\"action\":\"%@\",\"origin\":\"notif\"}", action]];
+}
+
+- (void)auditLog:(NSString *)ev json:(NSString *)json {
+    if (napAudit()) { NSLog(@"[AUD] %@ %@", ev, json); }
+}
+
+#pragma mark - KVO
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
+    if (context == kCurrentItemCtx) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self syncAfterItemChange]; });
+        return;
+    }
+    if (context == kTimeControlCtx) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (self.player == nil) { return; }
+            if (self.player.timeControlStatus == AVPlayerTimeControlStatusPlaying) {
+                [self endBufferKeepAlive];
+            } else if (self.shouldBePlaying) {
+                [self beginBufferKeepAlive];
+                if (self.player.timeControlStatus == AVPlayerTimeControlStatusPaused) {
+                    [self scheduleStallKick];
+                }
+            }
+            [self maybeEmitState];
+            [self refreshNowPlayingPlayback];
+        });
+        return;
+    }
+    if (context == kItemStatusCtx) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            AVPlayerItem *item = (AVPlayerItem *)object;
+            if (item.status != AVPlayerItemStatusFailed || ![self.liveItems containsObject:item]) { return; }
+            [self emitItemError:item code:@"queue_item_failed" message:item.error.localizedDescription];
+            [self skipFailedItem:item];
+        });
+        return;
+    }
+    [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+}
+
+#pragma mark - Now Playing
+
+- (void)refreshNowPlayingItem {
+    NSDictionary *meta = [self metaAtAbs:self.lastReportedIndex][@"metadata"] ?: @{};
+    self.nowPlaying = [NSMutableDictionary dictionary];
+    if (meta[@"title"]) { self.nowPlaying[MPMediaItemPropertyTitle] = meta[@"title"]; }
+    if (meta[@"artist"]) { self.nowPlaying[MPMediaItemPropertyArtist] = meta[@"artist"]; }
+    if (meta[@"album"]) { self.nowPlaying[MPMediaItemPropertyAlbumTitle] = meta[@"album"]; }
+    self.nowPlaying[MPMediaItemPropertyPlaybackDuration] = @([self durationMs] / 1000.0);
+    self.nowPlaying[MPNowPlayingInfoPropertyElapsedPlaybackTime] = @([self positionMs] / 1000.0);
+    self.nowPlaying[MPNowPlayingInfoPropertyPlaybackRate] = @(self.player.rate);
+    [self applyArtwork:meta[@"artworkUrl"]];
+    [[MPNowPlayingInfoCenter defaultCenter] setNowPlayingInfo:self.nowPlaying];
+}
+
+/** Rate/elapsed refresh on play / pause / seek / rate change — never periodic; the OS
+ *  interpolates the lock-screen progress bar from (elapsed, rate) itself. */
+- (void)refreshNowPlayingPlayback {
+    if (self.nowPlaying == nil) { return; }
+    self.nowPlaying[MPNowPlayingInfoPropertyElapsedPlaybackTime] = @([self positionMs] / 1000.0);
+    self.nowPlaying[MPNowPlayingInfoPropertyPlaybackRate] = @(self.player ? self.player.rate : 0);
+    [[MPNowPlayingInfoCenter defaultCenter] setNowPlayingInfo:self.nowPlaying];
+}
+
+- (void)applyArtwork:(NSString *)url {
+    if (url.length == 0) { return; }
+    if ([url isEqualToString:self.artworkUrl] && self.artwork != nil) {
+        self.nowPlaying[MPMediaItemPropertyArtwork] = self.artwork;
+        return;
+    }
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSURL *u = [self urlFromString:url];
+        NSData *data = u ? [NSData dataWithContentsOfURL:u] : nil;
+        UIImage *img = data ? [UIImage imageWithData:data] : nil;
+        if (img == nil) { return; }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.artworkUrl = url;
+            self.artwork = [[MPMediaItemArtwork alloc] initWithBoundsSize:img.size
+                                                           requestHandler:^UIImage * _Nonnull(CGSize size) { return img; }];
+            if (self.nowPlaying != nil) {
+                self.nowPlaying[MPMediaItemPropertyArtwork] = self.artwork;
+                [[MPNowPlayingInfoCenter defaultCenter] setNowPlayingInfo:self.nowPlaying];
+            }
+        });
+    });
+}
+
+#pragma mark - heartbeat (harness audit)
+
+- (void)startHeartbeat {
+    if (!napAudit()) { return; }
+    [self stopHeartbeat];
+    self.heartbeat = [NSTimer scheduledTimerWithTimeInterval:15.0 repeats:YES block:^(NSTimer *t) {
+        NativeAudioPlayer *s = self;
+        if (s.player == nil) { return; }
+        NSDictionary *meta = [s metaAtAbs:s.lastReportedIndex];
+        NSLog(@"[AUD] hb {\"pos\":%.0f,\"qIdx\":%ld,\"id\":\"%@\",\"playing\":%@,\"rate\":%.2f}",
+              [s positionMs], (long)s.lastReportedIndex, meta[@"id"] ?: @"",
+              s.player.rate != 0 ? @"true" : @"false", s.player.rate);
+    }];
+}
+
+- (void)stopHeartbeat {
+    if (self.heartbeat) { [self.heartbeat invalidate]; self.heartbeat = nil; }
+}
+
+#pragma mark - TTS synthesis
+
+- (void)audit:(CDVInvokedUrlCommand*)command {
+    NSString *line = [command argumentAtIndex:0 withDefault:@""];
+    if (napAudit()) { NSLog(@"[AUD] %@", line); }
+    [self ok:command];
+}
+
+- (void)getVoices:(CDVInvokedUrlCommand*)command {
+    NSMutableArray *arr = [NSMutableArray array];
+    for (AVSpeechSynthesisVoice *v in [AVSpeechSynthesisVoice speechVoices]) {
+        [arr addObject:@{ @"id": v.identifier,
+                          @"name": v.name,
+                          @"locale": v.language,
+                          @"quality": @(v.quality),
+                          @"requiresNetwork": @NO }];
+    }
+    [self.commandDelegate sendPluginResult:[CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsArray:arr]
+                                callbackId:command.callbackId];
+}
+
+- (void)synthesizeToFile:(CDVInvokedUrlCommand*)command {
+    NSDictionary *opts = [command argumentAtIndex:0 withDefault:@{}];
+    NSString *text = opts[@"text"];
+    NSString *voiceId = opts[@"voiceId"];
+    NSString *utteranceId = opts[@"utteranceId"];
+    if (text.length == 0 || utteranceId.length == 0) { [self fail:command msg:@"missing text or utteranceId"]; return; }
+
+    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject
+                     stringByAppendingPathComponent:@"tts-cache"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *caf = [dir stringByAppendingPathComponent:[utteranceId stringByAppendingPathExtension:@"caf"]];
+    NSString *sidecar = [dir stringByAppendingPathComponent:[utteranceId stringByAppendingPathExtension:@"json"]];
+
+    NSDictionary *cached = [self readSidecar:sidecar cafPath:caf];
+    if (cached != nil) {
+        [self.commandDelegate sendPluginResult:[CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:cached]
+                                    callbackId:command.callbackId];
+        return;
+    }
+
+    AVSpeechSynthesisVoice *voice = voiceId.length > 0 ? [AVSpeechSynthesisVoice voiceWithIdentifier:voiceId] : nil;
+    if (voice == nil && voiceId.length > 0) { [self fail:command msg:[@"voice not found: " stringByAppendingString:voiceId]]; return; }
+
+    AVSpeechUtterance *utterance = [AVSpeechUtterance speechUtteranceWithString:text];
+    utterance.rate = AVSpeechUtteranceDefaultSpeechRate;
+    if (voice) { utterance.voice = voice; }
+
+    NAPSynthJob *job = [NAPSynthJob new];
+    job.synth = [AVSpeechSynthesizer new];
+    job.synth.delegate = self;
+    job.timestamps = [NSMutableArray array];
+    job.callbackId = command.callbackId;
+    job.cafPath = caf;
+    job.sidecarPath = sidecar;
+    [self.synthJobs setObject:job forKey:utterance];
+
+    __weak NativeAudioPlayer *weakSelf = self;
+    [job.synth writeUtterance:utterance toBufferCallback:^(AVAudioBuffer *buffer) {
+        dispatch_async(weakSelf.synthQueue, ^{
+            NativeAudioPlayer *s = weakSelf;
+            if (s == nil || job.finished) { return; }
+            AVAudioPCMBuffer *pcm = [buffer isKindOfClass:[AVAudioPCMBuffer class]] ? (AVAudioPCMBuffer *)buffer : nil;
+            if (pcm == nil || pcm.frameLength == 0) {
+                [s finalizeSynthJob:job utterance:utterance];
+                return;
+            }
+            NSError *err = nil;
+            if (job.file == nil) {
+                job.sampleRate = pcm.format.sampleRate;
+                job.file = [[AVAudioFile alloc] initForWriting:[NSURL fileURLWithPath:job.cafPath]
+                                                      settings:pcm.format.settings error:&err];
+            }
+            if (err == nil && job.file != nil) {
+                [job.file writeFromBuffer:pcm error:&err];
+            }
+            if (err != nil) {
+                [s failSynthJob:job utterance:utterance message:err.localizedDescription];
+                return;
+            }
+            job.frames += pcm.frameLength;
+        });
+    }];
+}
+
+- (void)speechSynthesizer:(AVSpeechSynthesizer *)synthesizer willSpeakRangeOfSpeechString:(NSRange)characterRange utterance:(AVSpeechUtterance *)utterance {
+    dispatch_async(self.synthQueue, ^{
+        NAPSynthJob *job = [self.synthJobs objectForKey:utterance];
+        if (job == nil || job.finished) { return; }
+        double ms = job.sampleRate > 0 ? job.frames / job.sampleRate * 1000.0 : 0;
+        [job.timestamps addObject:@{ @"charStart": @(characterRange.location),
+                                     @"charEnd": @(characterRange.location + characterRange.length),
+                                     @"startMs": @(ms) }];
+    });
+}
+
+- (void)speechSynthesizer:(AVSpeechSynthesizer *)synthesizer didFinishSpeechUtterance:(AVSpeechUtterance *)utterance {
+    dispatch_async(self.synthQueue, ^{
+        NAPSynthJob *job = [self.synthJobs objectForKey:utterance];
+        if (job != nil) { [self finalizeSynthJob:job utterance:utterance]; }
+    });
+}
+
+- (void)speechSynthesizer:(AVSpeechSynthesizer *)synthesizer didCancelSpeechUtterance:(AVSpeechUtterance *)utterance {
+    dispatch_async(self.synthQueue, ^{
+        NAPSynthJob *job = [self.synthJobs objectForKey:utterance];
+        if (job != nil) { [self failSynthJob:job utterance:utterance message:@"synthesis canceled"]; }
+    });
+}
+
+- (void)finalizeSynthJob:(NAPSynthJob *)job utterance:(AVSpeechUtterance *)utterance {
+    if (job.finished) { return; }
+    job.finished = YES;
+    job.file = nil;
+    double durationMs = job.sampleRate > 0 ? job.frames / job.sampleRate * 1000.0 : 0;
+    if (durationMs <= 0) {
+        [[NSFileManager defaultManager] removeItemAtPath:job.cafPath error:nil];
+        [self sendSynthError:job message:@"synthesized file invalid"];
+        return;
+    }
+    NSDictionary *result = @{ @"fileUrl": [[NSURL fileURLWithPath:job.cafPath] absoluteString],
+                              @"durationMs": @(durationMs),
+                              @"wordTimestamps": [job.timestamps copy] };
+    NSDictionary *sidecar = @{ @"durationMs": @(durationMs), @"wordTimestamps": [job.timestamps copy] };
+    NSData *d = [NSJSONSerialization dataWithJSONObject:sidecar options:0 error:nil];
+    [d writeToFile:job.sidecarPath atomically:YES];
+    [self.synthJobs removeObjectForKey:utterance];
+    [self.commandDelegate sendPluginResult:[CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:result]
+                                callbackId:job.callbackId];
+}
+
+- (void)failSynthJob:(NAPSynthJob *)job utterance:(AVSpeechUtterance *)utterance message:(NSString *)message {
+    if (job.finished) { return; }
+    job.finished = YES;
+    job.file = nil;
+    [[NSFileManager defaultManager] removeItemAtPath:job.cafPath error:nil];
+    [self.synthJobs removeObjectForKey:utterance];
+    [self sendSynthError:job message:message];
+}
+
+- (void)sendSynthError:(NAPSynthJob *)job message:(NSString *)message {
+    [self.commandDelegate sendPluginResult:[CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:message]
+                                callbackId:job.callbackId];
+}
+
+- (NSDictionary *)readSidecar:(NSString *)sidecarPath cafPath:(NSString *)cafPath {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:sidecarPath] || ![fm fileExistsAtPath:cafPath]) { return nil; }
+    NSData *d = [NSData dataWithContentsOfFile:sidecarPath];
+    NSDictionary *o = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+    if (![o isKindOfClass:[NSDictionary class]]) { return nil; }
+    NSMutableDictionary *r = [o mutableCopy];
+    r[@"fileUrl"] = [[NSURL fileURLWithPath:cafPath] absoluteString];
+    return r;
+}
+
+#pragma mark - helpers
+
+/** Parse a URL string, percent-encoding as a fallback (raw Hebrew/space paths crash AVPlayerItem).
+ *  WebView-relative urls (bundled app assets) resolve into the packaged www folder. */
 - (NSURL *)urlFromString:(NSString *)url {
     if (url.length == 0) { return nil; }
+    if (![url containsString:@"://"]) {
+        NSString *wwwPath = [[[NSBundle mainBundle] resourcePath] stringByAppendingPathComponent:@"www"];
+        return [NSURL fileURLWithPath:[wwwPath stringByAppendingPathComponent:url]];
+    }
     NSURL *u = [NSURL URLWithString:url];
     if (u == nil) {
         NSString *enc = [url stringByAddingPercentEncodingWithAllowedCharacters:
@@ -170,533 +925,42 @@
     return u;
 }
 
-// A queue item played to its (clipped) end: AVQueuePlayer advances itself; we track the
-// index, refresh the Now Playing card, and tell JS (which may be frozen — that's fine).
-- (void)queueItemDidEnd:(NSNotification*)n {
-    if (!self.queueActive) { return; }
-    [self queueAdvanceAfter:(AVPlayerItem *)n.object];
-}
-
-// A CLIPPED item (forwardPlaybackEndTime) fires DidPlayToEnd but does NOT auto-advance
-// an AVQueuePlayer — the queue just stops there. Advance manually, restore the playback
-// rate (play resets it to 1), and keep the session alive.
-- (void)queueAdvanceAfter:(AVPlayerItem *)ended {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (!self.queueActive) { return; }
-        if ([self.player isKindOfClass:[AVQueuePlayer class]] && self.player.currentItem == ended) {
-            [(AVQueuePlayer *)self.player advanceToNextItem];
-        }
-        [self.player play];
-        if (self.requestedRate > 0 && self.requestedRate != 1) {
-            self.player.rate = self.requestedRate;
-        }
-        [self queueMovedForward];
-        NSLog(@"[NativeAudioPlayer] queue advanced -> index %ld (rate=%f)", (long)self.queueIndex, self.player.rate);
-    });
-}
-
-- (void)queueMovedForward {
-    self.queueIndex++;
-    if (self.queueIndex >= (NSInteger)self.queueAbsIndex.count) {
-        self.queueActive = NO;
-        self.shouldBePlaying = NO;
-        [self endBufferKeepAlive];
-        [self emit:@"ended" payload:@{ @"queue": @YES }];
-        return;
-    }
-    NSInteger abs = [self.queueAbsIndex[self.queueIndex] integerValue];
-    NSDictionary *meta = [self currentQueueMeta];
-    [self updateNowPlayingInfo:meta];
-    [self updateNowPlayingElapsed];
-    // Absolute index into the caller's original array (same contract as Android).
-    [self emit:@"transition" payload:@{ @"index": @(abs),
-                                        @"id": (meta[@"id"] ?: @"") }];
-}
-
-// A queue item failed to stream (404, network drop): report it and skip to the next
-// item so background playback continues instead of stalling silently forever.
-- (void)queueItemFailed:(NSNotification*)n {
-    NSError *e = n.userInfo[AVPlayerItemFailedToPlayToEndTimeErrorKey];
-    [self emit:@"error" payload:@{ @"code": @"queue_item_failed",
-                                   @"message": e.localizedDescription ?: @"queue item failed" }];
-    [self queueSkipFailedItem];
-}
-
-- (void)queueSkipFailedItem {
-    if (!self.queueActive || ![self.player isKindOfClass:[AVQueuePlayer class]]) { return; }
-    [(AVQueuePlayer *)self.player advanceToNextItem];
-    [self.player play];
-    [self queueMovedForward];
-}
-
-// Play the bundled silent clip on loop so the Now Playing card shows during TTS (which
-// produces no native track of its own). We loop it in itemDidEnd: so the audio session
-// stays active and the transport controls (which route to the app) stay live.
-- (void)playSilentLoop:(CDVInvokedUrlCommand*)command {
-    NSDictionary *opts = [command argumentAtIndex:0 withDefault:@{}];
-    NSString *path = [[NSBundle mainBundle] pathForResource:@"silence" ofType:@"mp3"];
-    if (path == nil) { [self fail:command msg:@"silence asset missing"]; return; }
-
-    [self configureSession];
-    [self teardownPlayer];
-    self.looping = YES;
-    self.clipDurationMs = 0;
-
-    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:path]];
-    self.player = [AVPlayer playerWithPlayerItem:item];
-    self.player.actionAtItemEnd = AVPlayerActionAtItemEndNone; // we re-seek on end ourselves
-    [self setupTimeObserver];
-    [self setupRemoteCommands];
-
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(itemDidEnd:)
-                                                 name:AVPlayerItemDidPlayToEndTimeNotification
-                                               object:item];
-
-    self.shouldBePlaying = YES;
-    [self.player play];
-    [self updateNowPlayingInfo:opts];
-    [self updateNowPlayingElapsed];
-    [self emitState];
-    [self ok:command];
-}
-
-// Build one queue AVPlayerItem (clip + pitch + observers) and register bookkeeping.
-- (AVPlayerItem *)buildQueueItemFrom:(NSDictionary *)o absIndex:(NSInteger)i {
-    NSURL *u = [self urlFromString:o[@"url"]];
-    if (u == nil) { return nil; }
-    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:u];
-    item.audioTimePitchAlgorithm = AVAudioTimePitchAlgorithmSpectral;
-    double dur = [[o objectForKey:@"durationMs"] doubleValue];
-    if (dur > 0) {
-        item.forwardPlaybackEndTime = CMTimeMakeWithSeconds(dur / 1000.0, NSEC_PER_SEC);
-    }
-    [self.queueAbsIndex addObject:@(i)];
-    [self.queueItems addObject:item];
-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(queueItemDidEnd:)
-        name:AVPlayerItemDidPlayToEndTimeNotification object:item];
-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(queueItemFailed:)
-        name:AVPlayerItemFailedToPlayToEndTimeNotification object:item];
-    [item addObserver:self forKeyPath:@"status" options:NSKeyValueObservingOptionNew context:nil];
-    return item;
-}
-
-// Background handoff WITHOUT touching the playing verse: append the upcoming verses after
-// the current item and give the current item a real end point (JS is about to be frozen,
-// so it can no longer cut the trailing silence or advance verses itself).
-- (void)appendQueue:(CDVInvokedUrlCommand*)command {
-    NSArray *items = [command argumentAtIndex:0 withDefault:@[]];
-    double currentEndMs = [[command argumentAtIndex:1 withDefault:@0] doubleValue];
-    if (![self.player isKindOfClass:[AVQueuePlayer class]] || self.player.currentItem == nil) {
-        [self fail:command msg:@"no active player"]; return;
-    }
-    if (items.count == 0) { [self fail:command msg:@"empty items"]; return; }
-    AVQueuePlayer *qp = (AVQueuePlayer *)self.player;
-
-    if (currentEndMs > 0 && currentEndMs > [self positionMs] + 300) {
-        self.player.currentItem.forwardPlaybackEndTime = CMTimeMakeWithSeconds(currentEndMs / 1000.0, NSEC_PER_SEC);
-    }
-
-    self.queueMeta = [items mutableCopy];
-    self.queueAbsIndex = [NSMutableArray array];
-    self.queueItems = [NSMutableArray array];
-    self.queueIndex = -1; // the pre-queue item is still playing
-
-    AVPlayerItem *after = qp.items.lastObject;
-    NSInteger appended = 0;
-    for (NSInteger i = 0; i < (NSInteger)items.count; i++) {
-        AVPlayerItem *item = [self buildQueueItemFrom:items[i] absIndex:i];
-        if (item == nil) { continue; }
-        if ([qp canInsertItem:item afterItem:after]) {
-            [qp insertItem:item afterItem:after];
-            after = item;
-            appended++;
-        }
-    }
-    if (appended == 0) { [self fail:command msg:@"nothing appended"]; return; }
-    self.queueActive = YES;
-    self.shouldBePlaying = YES;
-    NSLog(@"[NativeAudioPlayer] appendQueue: %ld items after current (currentEndMs=%.0f)", (long)appended, currentEndMs);
-    [self ok:command];
-}
-
-- (void)play:(CDVInvokedUrlCommand*)command {
-    self.shouldBePlaying = YES;
-    if (self.player) { [self.player play]; [self emitState]; }
-    [self ok:command];
-}
-
-- (void)pause:(CDVInvokedUrlCommand*)command {
-    self.shouldBePlaying = NO;
-    [self endBufferKeepAlive];
-    if (self.player) { [self.player pause]; [self emitState]; }
-    [self ok:command];
-}
-
-- (void)stop:(CDVInvokedUrlCommand*)command {
-    self.shouldBePlaying = NO;
-    self.looping = NO;
-    [self teardownPlayer];
-    [[MPNowPlayingInfoCenter defaultCenter] setNowPlayingInfo:nil];
-    [self ok:command];
-}
-
-- (void)seekTo:(CDVInvokedUrlCommand*)command {
-    double ms = [[command argumentAtIndex:0 withDefault:@0] doubleValue];
-    if (self.player) {
-        [self.player seekToTime:CMTimeMakeWithSeconds(ms / 1000.0, NSEC_PER_SEC)];
-        [self updateNowPlayingElapsed];
-    }
-    [self ok:command];
-}
-
-- (void)setRate:(CDVInvokedUrlCommand*)command {
-    float rate = [[command argumentAtIndex:0 withDefault:@1] floatValue];
-    self.requestedRate = rate;
-    if (self.player && self.player.rate != 0) { self.player.rate = rate; }
-    [self ok:command];
-}
-
-- (void)updateMetadata:(CDVInvokedUrlCommand*)command {
-    NSDictionary *opts = [command argumentAtIndex:0 withDefault:@{}];
-    [self updateNowPlayingInfo:opts];
-    [self ok:command];
-}
-
-- (void)getPosition:(CDVInvokedUrlCommand*)command {
-    NSDictionary *r = @{ @"positionMs": @([self positionMs]), @"durationMs": @([self durationMs]) };
-    [self.commandDelegate sendPluginResult:[CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:r]
-                                callbackId:command.callbackId];
-}
-
-#pragma mark - internals
-
-- (void)configureSession {
-    // Phone calls / Siri pause AVPlayer without any callback to the app — tell JS so the
-    // in-app player and the verse loop don't hang in a phantom "playing" state.
-    if (!self.interruptionRegistered) {
-        self.interruptionRegistered = YES;
-        [[NSNotificationCenter defaultCenter] addObserver:self
-                                                 selector:@selector(sessionInterrupted:)
-                                                     name:AVAudioSessionInterruptionNotification
-                                                   object:nil];
-        // WKWebView silently re-flips the SHARED AVAudioSession category under us, so at
-        // background-entry the media system can consider the app non-entitled and post a
-        // Pause. Re-assert the session on every background entry (we still have runtime).
-        [[NSNotificationCenter defaultCenter] addObserver:self
-                                                 selector:@selector(appEnteredBackground:)
-                                                     name:UIApplicationDidEnterBackgroundNotification
-                                                   object:nil];
-        // The current item ran out of buffered data (streaming verse in the background).
-        // With waits=YES the player recovers on its own; we just have to survive the gap.
-        [[NSNotificationCenter defaultCenter] addObserver:self
-                                                 selector:@selector(playbackStalled:)
-                                                     name:AVPlayerItemPlaybackStalledNotification
-                                                   object:nil];
-    }
-    AVAudioSession *s = [AVAudioSession sharedInstance];
-    NSError *catErr = nil;
-    NSError *actErr = nil;
-    // Force Playback + Default mode. The shared AVAudioSession may be left in
-    // PlayAndRecord / VoiceChat / Measurement mode by the microphone (Rabbi AI voice chat),
-    // the TTS plugin, or the WebView — which routes to the earpiece / narrowband voice
-    // processing and makes verse audio sound bad. The full setCategory:mode:options: form
-    // resets the mode to high-quality media playback (the 2-arg form does NOT reset mode).
-    [s setCategory:AVAudioSessionCategoryPlayback
-              mode:AVAudioSessionModeDefault
-           options:0
-             error:&catErr];
-    [s setActive:YES error:&actErr];
-    NSLog(@"[NativeAudioPlayer] session category=%@ mode=%@ catErr=%@ actErr=%@", s.category, s.mode, catErr, actErr);
-}
-
-- (void)setupTimeObserver {
-    // Track buffering: WaitingToPlayAtSpecifiedRate means the player is silent while it
-    // loads — hold a background task so iOS doesn't suspend us mid-download.
-    [self.player addObserver:self forKeyPath:@"timeControlStatus"
-                     options:NSKeyValueObservingOptionNew context:nil];
-    __weak NativeAudioPlayer *weakSelf = self;
-    self.timeObserver = [self.player addPeriodicTimeObserverForInterval:CMTimeMakeWithSeconds(0.1, NSEC_PER_SEC)
-                                                                  queue:dispatch_get_main_queue()
-                                                             usingBlock:^(CMTime time) {
-        NativeAudioPlayer *s = weakSelf;
-        if (s == nil || s.player.rate == 0) { return; }
-        NSMutableDictionary *p = [NSMutableDictionary dictionaryWithDictionary:
-            @{ @"positionMs": @([s positionMs]), @"durationMs": @([s durationMs]) }];
-        if (s.queueActive && s.queueIndex >= 0 && s.queueIndex < (NSInteger)s.queueAbsIndex.count) {
-            p[@"index"] = s.queueAbsIndex[s.queueIndex];
-            p[@"id"] = [s currentQueueMeta][@"id"] ?: @"";
-        }
-        [s emit:@"position" payload:p];
-        [s updateNowPlayingElapsed];
-    }];
-}
-
-- (void)setupRemoteCommands {
-    // Register handlers ONCE for the app lifetime. They reference self.player (updated on
-    // each load), so they always control the current verse. Re-adding them per load would
-    // accumulate duplicate handlers, so a single PLAY press would fire replay() N times.
-    if (self.remoteCommandsRegistered) { return; }
-    self.remoteCommandsRegistered = YES;
-    MPRemoteCommandCenter *c = [MPRemoteCommandCenter sharedCommandCenter];
-    __weak NativeAudioPlayer *weakSelf = self;
-    [c.playCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) {
-        weakSelf.shouldBePlaying = YES;
-        [weakSelf.player play]; [weakSelf emitControl:@"play"]; return MPRemoteCommandHandlerStatusSuccess; }];
-    [c.pauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) {
-        weakSelf.shouldBePlaying = NO;
-        [weakSelf.player pause]; [weakSelf updateNowPlayingElapsed];
-        [weakSelf emitControl:@"pause"]; return MPRemoteCommandHandlerStatusSuccess; }];
-    [c.nextTrackCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) {
-        NativeAudioPlayer *s = weakSelf;
-        if (s.queueActive && [s.player isKindOfClass:[AVQueuePlayer class]]) {
-            // Navigate the native queue directly — JS may be frozen in the background.
-            [(AVQueuePlayer *)s.player advanceToNextItem];
-            [s.player play];
-            [s queueMovedForward];
-        } else {
-            [s emitControl:@"next"];
-        }
-        return MPRemoteCommandHandlerStatusSuccess; }];
-    [c.previousTrackCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) {
-        NativeAudioPlayer *s = weakSelf;
-        if (s.queueActive) {
-            // AVQueuePlayer can't go backwards; restart the current verse (standard behavior).
-            [s.player seekToTime:kCMTimeZero];
-            [s updateNowPlayingElapsed];
-        } else {
-            [s emitControl:@"previous"];
-        }
-        return MPRemoteCommandHandlerStatusSuccess; }];
-    c.nextTrackCommand.enabled = YES;
-    c.previousTrackCommand.enabled = YES;
-    [c.changePlaybackPositionCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) {
-        MPChangePlaybackPositionCommandEvent *pe = (MPChangePlaybackPositionCommandEvent *)e;
-        [weakSelf.player seekToTime:CMTimeMakeWithSeconds(pe.positionTime, NSEC_PER_SEC)];
-        [weakSelf emitControl:@"seek"]; return MPRemoteCommandHandlerStatusSuccess; }];
-}
-
-- (void)updateNowPlayingInfo:(NSDictionary*)opts {
-    if (self.nowPlaying == nil) { self.nowPlaying = [NSMutableDictionary dictionary]; }
-    if (opts[@"title"]) { self.nowPlaying[MPMediaItemPropertyTitle] = opts[@"title"]; }
-    if (opts[@"artist"]) { self.nowPlaying[MPMediaItemPropertyArtist] = opts[@"artist"]; }
-    if (opts[@"album"]) { self.nowPlaying[MPMediaItemPropertyAlbumTitle] = opts[@"album"]; }
-    self.nowPlaying[MPNowPlayingInfoPropertyPlaybackRate] = @(self.player.rate);
-    [[MPNowPlayingInfoCenter defaultCenter] setNowPlayingInfo:self.nowPlaying];
-
-    NSString *artwork = opts[@"artwork"];
-    if (artwork.length > 0) {
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            NSData *data = [NSData dataWithContentsOfURL:[NSURL URLWithString:artwork]];
-            UIImage *img = data ? [UIImage imageWithData:data] : nil;
-            if (img == nil) { return; }
-            dispatch_async(dispatch_get_main_queue(), ^{
-                MPMediaItemArtwork *art = [[MPMediaItemArtwork alloc] initWithBoundsSize:img.size
-                                                                         requestHandler:^UIImage * _Nonnull(CGSize size) { return img; }];
-                self.nowPlaying[MPMediaItemPropertyArtwork] = art;
-                [[MPNowPlayingInfoCenter defaultCenter] setNowPlayingInfo:self.nowPlaying];
-            });
-        });
-    }
-}
-
-- (void)updateNowPlayingElapsed {
-    if (self.nowPlaying == nil) { return; }
-    self.nowPlaying[MPNowPlayingInfoPropertyElapsedPlaybackTime] = @([self positionMs] / 1000.0);
-    self.nowPlaying[MPMediaItemPropertyPlaybackDuration] = @([self durationMs] / 1000.0);
-    self.nowPlaying[MPNowPlayingInfoPropertyPlaybackRate] = @(self.player.rate);
-    [[MPNowPlayingInfoCenter defaultCenter] setNowPlayingInfo:self.nowPlaying];
-}
-
-- (void)itemDidEnd:(NSNotification*)n {
-    if (self.looping) {
-        // Silent keep-alive track: restart it seamlessly instead of ending.
-        [self.player seekToTime:kCMTimeZero];
-        [self.player play];
-        return;
-    }
-    if (self.queueActive && self.queueIndex < 0) {
-        // The pre-queue item finished; advance into the appended queue (a clipped item
-        // does not auto-advance the AVQueuePlayer).
-        [self queueAdvanceAfter:(AVPlayerItem *)n.object];
-        return;
-    }
-    [self emit:@"ended" payload:@{}];
-}
-
-- (void)itemFailed:(NSNotification*)n {
-    NSError *e = n.userInfo[AVPlayerItemFailedToPlayToEndTimeErrorKey];
-    [self emit:@"error" payload:@{ @"code": @"player_error",
-                                   @"message": e.localizedDescription ?: @"failed to play to end" }];
-}
-
-- (void)sessionInterrupted:(NSNotification*)n {
-    NSUInteger type = [n.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
-    if (type != AVAudioSessionInterruptionTypeBegan) { return; }
-    // Backgrounding "interruption": iOS pauses us because WKWebView flipped the shared
-    // session's category out from under our Playback config. If we SHOULD be playing,
-    // re-assert the session and resume on the spot — a real interruption (phone call)
-    // fails session activation here and falls through to the pause path.
-    if (self.shouldBePlaying && self.player != nil &&
-        [UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
-        AVAudioSession *s = [AVAudioSession sharedInstance];
-        NSError *catErr = nil; NSError *actErr = nil;
-        [s setCategory:AVAudioSessionCategoryPlayback mode:AVAudioSessionModeDefault options:0 error:&catErr];
-        [s setActive:YES error:&actErr];
-        if (actErr == nil) {
-            [self.player play];
-            NSLog(@"[NativeAudioPlayer] background interruption -> session re-asserted, playback resumed");
-            return;
-        }
-        NSLog(@"[NativeAudioPlayer] background interruption -> session reactivation FAILED: %@", actErr);
-    }
-    [self.player pause];
-    [self emitControl:@"pause"];
-}
-
-- (void)appEnteredBackground:(NSNotification*)n {
-    if (!self.shouldBePlaying || self.player == nil) { return; }
-    AVAudioSession *s = [AVAudioSession sharedInstance];
-    NSError *actErr = nil;
-    [s setCategory:AVAudioSessionCategoryPlayback mode:AVAudioSessionModeDefault options:0 error:nil];
-    [s setActive:YES error:&actErr];
-    if (self.player.rate == 0) { [self.player play]; }
-    // Already buffering at background-entry: no timeControl change will fire, so make sure
-    // the keep-alive is held right now.
-    if (self.player.timeControlStatus != AVPlayerTimeControlStatusPlaying) { [self beginBufferKeepAlive]; }
-    NSLog(@"[NativeAudioPlayer] entered background: session re-asserted (actErr=%@) rate=%f timeControl=%ld",
-          actErr, self.player.rate, (long)self.player.timeControlStatus);
-}
-
-// Buffering keep-alive: while the player is loading (silent), iOS sees no audio and can
-// suspend the app; a named background task keeps the process (and the download) running.
-- (void)beginBufferKeepAlive {
-    if (self.bufferKeepAlive != UIBackgroundTaskInvalid) { return; }
-    __weak NativeAudioPlayer *weakSelf = self;
-    self.bufferKeepAlive = [[UIApplication sharedApplication]
-        beginBackgroundTaskWithName:@"audio-buffering"
-                  expirationHandler:^{ [weakSelf endBufferKeepAlive]; }];
-    NSLog(@"[NativeAudioPlayer] buffering keep-alive begun");
-}
-
-- (void)endBufferKeepAlive {
-    if (self.bufferKeepAlive == UIBackgroundTaskInvalid) { return; }
-    [[UIApplication sharedApplication] endBackgroundTask:self.bufferKeepAlive];
-    self.bufferKeepAlive = UIBackgroundTaskInvalid;
-}
-
-- (void)timeControlChanged {
-    if (self.player == nil) { return; }
-    AVPlayerTimeControlStatus st = self.player.timeControlStatus;
-    if (st == AVPlayerTimeControlStatusPlaying) {
-        [self endBufferKeepAlive];
-        return;
-    }
-    if (!self.shouldBePlaying) { return; }
-    [self beginBufferKeepAlive];
-    if (st == AVPlayerTimeControlStatusPaused && self.player.currentItem != nil) {
-        // An intentionally playing player should never park on Paused (waits=YES buffers on
-        // Waiting instead) — this is the stall-reset path, kick playback back on.
-        NSLog(@"[NativeAudioPlayer] timeControl Paused while shouldBePlaying -> re-play");
-        [self.player play];
-    }
-}
-
-- (void)playbackStalled:(NSNotification*)n {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (!self.shouldBePlaying || self.player == nil) { return; }
-        NSLog(@"[NativeAudioPlayer] playback stalled (timeControl=%ld) -> keep-alive", (long)self.player.timeControlStatus);
-        [self beginBufferKeepAlive];
-        if (self.player.timeControlStatus == AVPlayerTimeControlStatusPaused) { [self.player play]; }
-    });
-}
-
-- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
-    if ([keyPath isEqualToString:@"timeControlStatus"] && object == self.player) {
-        dispatch_async(dispatch_get_main_queue(), ^{ [self timeControlChanged]; });
-        return;
-    }
-    if ([keyPath isEqualToString:@"status"] && object == self.observedItem) {
-        AVPlayerItem *item = (AVPlayerItem *)object;
-        if (item.status == AVPlayerItemStatusFailed) {
-            [self emit:@"error" payload:@{ @"code": @"player_error",
-                                           @"message": item.error.localizedDescription ?: @"item failed" }];
-        }
-        return;
-    }
-    if ([keyPath isEqualToString:@"status"] && [self.queueItems containsObject:(AVPlayerItem *)object]) {
-        AVPlayerItem *item = (AVPlayerItem *)object;
-        if (item.status == AVPlayerItemStatusFailed && item == self.player.currentItem) {
-            // A queued verse failed to LOAD (e.g. 404): report + skip so the queue moves on.
-            [self emit:@"error" payload:@{ @"code": @"queue_item_failed",
-                                           @"message": item.error.localizedDescription ?: @"queue item load failed" }];
-            [self queueSkipFailedItem];
-        }
-        return;
-    }
-    [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
-}
-
 - (double)positionMs {
     if (self.player == nil) { return 0; }
-    return CMTimeGetSeconds(self.player.currentTime) * 1000.0;
+    double s = CMTimeGetSeconds(self.player.currentTime);
+    return isnan(s) ? 0 : s * 1000.0;
 }
 
 - (double)durationMs {
-    // Prefer the clip length (real speech length); the item's own duration is unreliable.
-    if (self.queueActive && self.player.currentItem != nil) {
-        CMTime f = self.player.currentItem.forwardPlaybackEndTime;
-        if (CMTIME_IS_VALID(f)) {
-            double fs = CMTimeGetSeconds(f);
-            if (fs > 0) { return fs * 1000.0; }
-        }
+    AVPlayerItem *cur = self.player.currentItem;
+    if (cur == nil) { return 0; }
+    CMTime f = cur.forwardPlaybackEndTime;
+    if (CMTIME_IS_VALID(f)) {
+        double fs = CMTimeGetSeconds(f);
+        if (fs > 0) { return fs * 1000.0; }
     }
-    if (self.clipDurationMs > 0) { return self.clipDurationMs; }
-    if (self.displayDurationMs > 0) { return self.displayDurationMs; }
-    if (self.player.currentItem == nil) { return 0; }
-    double d = CMTimeGetSeconds(self.player.currentItem.duration);
+    double d = CMTimeGetSeconds(cur.duration);
     return isnan(d) ? 0 : d * 1000.0;
 }
 
-- (void)teardownPlayer {
-    self.queueActive = NO;
-    self.queueMeta = nil;
-    self.queueAbsIndex = nil;
-    self.queueIndex = 0;
-    self.displayDurationMs = 0;
-    for (AVPlayerItem *qi in self.queueItems) {
-        @try { [qi removeObserver:self forKeyPath:@"status"]; } @catch (NSException *ex) { /* not registered */ }
+- (void)removeItemObservers {
+    for (AVPlayerItem *item in self.liveItems) {
+        @try { [item removeObserver:self forKeyPath:@"status" context:kItemStatusCtx]; } @catch (NSException *ex) {}
     }
-    self.queueItems = nil;
-    if (self.timeObserver && self.player) { [self.player removeTimeObserver:self.timeObserver]; self.timeObserver = nil; }
-    [[NSNotificationCenter defaultCenter] removeObserver:self name:AVPlayerItemDidPlayToEndTimeNotification object:nil];
-    [[NSNotificationCenter defaultCenter] removeObserver:self name:AVPlayerItemFailedToPlayToEndTimeNotification object:nil];
-    if (self.observedItem) {
-        @try { [self.observedItem removeObserver:self forKeyPath:@"status"]; } @catch (NSException *ex) { /* not registered */ }
-        self.observedItem = nil;
-    }
+    self.liveItems = nil;
+}
+
+- (void)teardownPlayback {
+    [self stopHeartbeat];
+    [self removeItemObservers];
+    self.lastReportedIndex = -1;
     if (self.player) {
-        @try { [self.player removeObserver:self forKeyPath:@"timeControlStatus"]; } @catch (NSException *ex) { /* not registered */ }
+        @try { [self.player removeObserver:self forKeyPath:@"currentItem" context:kCurrentItemCtx]; } @catch (NSException *ex) {}
+        @try { [self.player removeObserver:self forKeyPath:@"timeControlStatus" context:kTimeControlCtx]; } @catch (NSException *ex) {}
         [self.player pause];
         self.player = nil;
     }
     [self endBufferKeepAlive];
-}
-
-- (void)emitState {
-    NSString *state = (self.player && self.player.rate != 0) ? @"playing" : @"paused";
-    [self emit:@"state" payload:@{ @"state": state }];
-}
-
-- (void)emitControl:(NSString*)action { [self emit:@"control" payload:@{ @"action": action }]; }
-
-- (void)emit:(NSString*)type payload:(NSDictionary*)payload {
-    if (self.eventsCallbackId == nil) { return; }
-    NSMutableDictionary *o = [payload mutableCopy] ?: [NSMutableDictionary dictionary];
-    o[@"type"] = type;
-    CDVPluginResult *r = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:o];
-    [r setKeepCallbackAsBool:YES];
-    [self.commandDelegate sendPluginResult:r callbackId:self.eventsCallbackId];
 }
 
 - (void)ok:(CDVInvokedUrlCommand*)command {

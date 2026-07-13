@@ -2,7 +2,7 @@
 <plugin xmlns="http://apache.org/cordova/ns/plugins/1.0"
         xmlns:android="http://schemas.android.com/apk/res/android"
         id="cordova-plugin-native-audio-player"
-        version="0.1.0">
+        version="2.0.0">
 
   <name>NativeAudioPlayer</name>
   <description>Native background audio with a Spotify/YouTube-style OS media player (Android Media3, iOS AVPlayer + Now Playing).</description>
@@ -41,9 +41,6 @@
     <source-file src="src/android/NativeAudioPlayer.java" target-dir="src/com/moshecohen/nativeaudio" />
     <source-file src="src/android/PlaybackService.java" target-dir="src/com/moshecohen/nativeaudio" />
 
-    <!-- Silent loop played under TTS so the OS media player still shows (no native track otherwise). -->
-    <resource-file src="src/assets/silence.mp3" target="res/raw/silence.mp3" />
-
     <framework src="androidx.media3:media3-exoplayer:1.4.1" />
     <framework src="androidx.media3:media3-session:1.4.1" />
     <framework src="androidx.media3:media3-ui:1.4.1" />
@@ -65,9 +62,6 @@
 
     <header-file src="src/ios/NativeAudioPlayer.h" />
     <source-file src="src/ios/NativeAudioPlayer.m" />
-
-    <!-- Silent loop played under TTS so the Now Playing card still shows (no native track otherwise). -->
-    <resource-file src="src/assets/silence.mp3" />
 
     <framework src="AVFoundation.framework" />
     <framework src="MediaPlayer.framework" />

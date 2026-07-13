@@ -1,12 +1,18 @@
 package com.moshecohen.nativeaudio;
 
 import android.content.Intent;
+import android.content.pm.ApplicationInfo;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.Log;
 
 import androidx.annotation.Nullable;
 import androidx.annotation.OptIn;
 import androidx.media3.common.AudioAttributes;
 import androidx.media3.common.C;
 import androidx.media3.common.ForwardingPlayer;
+import androidx.media3.common.MediaItem;
 import androidx.media3.common.Player;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.exoplayer.ExoPlayer;
@@ -14,29 +20,27 @@ import androidx.media3.session.MediaSession;
 import androidx.media3.session.MediaSessionService;
 
 /**
- * Media3 MediaSessionService. Owning the ExoPlayer here (not in the WebView) is what
- * gives us the OS-native media notification / lock-screen player — the same component
- * YouTube Music and Spotify use — plus reliable background playback and audio focus.
- * Media3 posts and tears down the foreground notification automatically.
+ * Media3 MediaSessionService. Owning the ExoPlayer here (not in the WebView) is what gives
+ * the OS-native media notification / lock-screen player, reliable background playback and
+ * audio focus. Media3 posts and tears down the foreground notification automatically.
+ *
+ * Queue items are verse SEGMENTS; items flagged boundary=true (metadata extras) start a
+ * verse. The notification's next/previous seek by verse boundary NATIVELY, so lock-screen
+ * navigation works even when the WebView is frozen in the background.
  */
 @OptIn(markerClass = UnstableApi.class)
 public class PlaybackService extends MediaSessionService {
-  private MediaSession mediaSession = null;
+  private static final String AUDIT_TAG = "AUD";
+  private static final long HEARTBEAT_MS = 15000;
 
-  /** Lets the plugin route the notification's transport buttons to the app. */
-  public interface NavListener {
-    void onNext();
-    void onPrevious();
-    void onPause();
-    void onPlay();
-  }
-  private static NavListener navListener = null;
-  public static void setNavListener(NavListener l) { navListener = l; }
+  private MediaSession mediaSession = null;
+  private final Handler main = new Handler(Looper.getMainLooper());
+  private Runnable heartbeat;
+  private boolean audit;
 
   // Same-process handle for reading the REAL player position. The plugin's
   // MediaController.getCurrentPosition() is an extrapolated estimate that can freeze
-  // mid-item (seen on Android 16), which stalls JS word-highlighting for the rest of
-  // the verse while the audio keeps playing.
+  // mid-item (seen on Android 16), which stalls word-highlighting while audio plays on.
   private static PlaybackService instance = null;
 
   /** Actual player position in ms, or -1 when the service/player is unavailable.
@@ -55,6 +59,7 @@ public class PlaybackService extends MediaSessionService {
   public void onCreate() {
     super.onCreate();
     instance = this;
+    audit = (getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0;
     ExoPlayer player = new ExoPlayer.Builder(this)
         .setAudioAttributes(
             new AudioAttributes.Builder()
@@ -65,11 +70,39 @@ public class PlaybackService extends MediaSessionService {
         .setHandleAudioBecomingNoisy(true)
         .build();
 
-    // Single-verse mode (no playlist): Media3 would hide "next" and make "prev" only restart
-    // the verse, so force both buttons and forward them to the app. Queue mode (background
-    // playlist): let Media3 navigate the playlist NATIVELY — the app's JS may be frozen.
-    Player navPlayer = new ForwardingPlayer(player) {
-      private boolean hasQueue() { return getMediaItemCount() > 1; }
+    Player versePlayer = new ForwardingPlayer(player) {
+      private boolean isBoundary(int index) {
+        MediaItem item = getMediaItemAt(index);
+        Bundle extras = item.mediaMetadata.extras;
+        return extras == null || extras.getBoolean("boundary", true);
+      }
+
+      private int currentVerseStart() {
+        int i = getCurrentMediaItemIndex();
+        while (i > 0 && !isBoundary(i)) { i--; }
+        return i;
+      }
+
+      private void seekToNextVerse() {
+        int count = getMediaItemCount();
+        for (int i = getCurrentMediaItemIndex() + 1; i < count; i++) {
+          if (isBoundary(i)) {
+            auditControl("next", i);
+            seekTo(i, 0);
+            return;
+          }
+        }
+      }
+
+      private void seekToPreviousVerse() {
+        int start = currentVerseStart();
+        int target = start;
+        for (int i = start - 1; i >= 0; i--) {
+          if (isBoundary(i)) { target = i; break; }
+        }
+        auditControl("previous", target);
+        seekTo(target, 0);
+      }
 
       @Override
       public Commands getAvailableCommands() {
@@ -88,70 +121,29 @@ public class PlaybackService extends MediaSessionService {
       }
 
       @Override
-      public boolean hasNextMediaItem() { return hasQueue() ? super.hasNextMediaItem() : true; }
+      public boolean hasNextMediaItem() { return true; }
 
       @Override
-      public boolean hasPreviousMediaItem() { return hasQueue() ? super.hasPreviousMediaItem() : true; }
+      public boolean hasPreviousMediaItem() { return true; }
 
       @Override
-      public void seekToNext() {
-        if (hasQueue()) { super.seekToNext(); return; }
-        if (navListener != null) navListener.onNext();
-      }
+      public void seekToNext() { seekToNextVerse(); }
 
       @Override
-      public void seekToPrevious() {
-        if (hasQueue()) { super.seekToPrevious(); return; }
-        if (navListener != null) navListener.onPrevious();
-      }
+      public void seekToNextMediaItem() { seekToNextVerse(); }
 
       @Override
-      public void seekToNextMediaItem() {
-        if (hasQueue()) { super.seekToNextMediaItem(); return; }
-        if (navListener != null) navListener.onNext();
-      }
+      public void seekToPrevious() { seekToPreviousVerse(); }
 
       @Override
-      public void seekToPreviousMediaItem() {
-        if (hasQueue()) { super.seekToPreviousMediaItem(); return; }
-        if (navListener != null) navListener.onPrevious();
-      }
-
-      // Route pause to the app so its in-app toolbar stays in sync (the app has no
-      // mid-verse resume, so a user pause == stop). Media3 delivers the notification's
-      // pause via pause() — which does NOT pass through setPlayWhenReady on a
-      // ForwardingPlayer — so both entry points are overridden. The app's own
-      // programmatic pause is suppressed on the JS side (it knows it asked).
-      @Override
-      public void pause() {
-        if (getPlayWhenReady() && navListener != null) {
-          navListener.onPause();
-        }
-        super.pause();
-      }
-
-      // Resuming a PAUSED-mid-track player (notification play button) — tell the app so
-      // its toolbar leaves the paused state. Fresh loads start from IDLE/BUFFERING, so
-      // they don't trigger this.
-      @Override
-      public void play() {
-        boolean resumingPaused = !getPlayWhenReady() && getPlaybackState() == Player.STATE_READY;
-        super.play();
-        if (resumingPaused && navListener != null) {
-          navListener.onPlay();
-        }
-      }
-
-      @Override
-      public void setPlayWhenReady(boolean playWhenReady) {
-        if (!playWhenReady && getPlayWhenReady() && navListener != null) {
-          navListener.onPause();
-        }
-        super.setPlayWhenReady(playWhenReady);
-      }
+      public void seekToPreviousMediaItem() { seekToPreviousVerse(); }
     };
 
-    mediaSession = new MediaSession.Builder(this, navPlayer).build();
+    mediaSession = new MediaSession.Builder(this, versePlayer).build();
+    if (audit) {
+      player.addListener(new AuditEvents());
+      startHeartbeat(player);
+    }
   }
 
   @Override
@@ -163,12 +155,7 @@ public class PlaybackService extends MediaSessionService {
   @Override
   public void onTaskRemoved(@Nullable Intent rootIntent) {
     Player player = mediaSession != null ? mediaSession.getPlayer() : null;
-    // The silent TTS keep-alive loop has no JS driver once the task is swiped away —
-    // without this check it would loop a "playing" notification forever.
-    boolean silentKeepAlive = player != null && player.getMediaItemCount() > 0
-        && player.getCurrentMediaItem() != null
-        && "silence".equals(player.getCurrentMediaItem().mediaId);
-    if (player == null || !player.getPlayWhenReady() || player.getMediaItemCount() == 0 || silentKeepAlive) {
+    if (player == null || !player.getPlayWhenReady() || player.getMediaItemCount() == 0) {
       if (player != null) {
         player.stop();
         player.clearMediaItems();
@@ -177,9 +164,49 @@ public class PlaybackService extends MediaSessionService {
     }
   }
 
+  private void auditControl(String action, int targetIndex) {
+    if (audit) Log.i(AUDIT_TAG, "control {\"action\":\"" + action + "\",\"origin\":\"notif\",\"target\":" + targetIndex + "}");
+  }
+
+  /** Service-side audit markers survive a frozen or dead WebView (same file: harness needs them). */
+  private class AuditEvents implements Player.Listener {
+    @Override
+    public void onMediaItemTransition(MediaItem item, int reason) {
+      Player p = mediaSession != null ? mediaSession.getPlayer() : null;
+      Log.i(AUDIT_TAG, "svcTransition {\"index\":" + (p != null ? p.getCurrentMediaItemIndex() : -1)
+          + ",\"id\":\"" + (item != null ? item.mediaId : "") + "\",\"reason\":" + reason + "}");
+    }
+
+    @Override
+    public void onIsPlayingChanged(boolean isPlaying) {
+      Log.i(AUDIT_TAG, "svcPlaying {\"playing\":" + isPlaying + "}");
+    }
+
+    @Override
+    public void onPlaybackStateChanged(int state) {
+      Log.i(AUDIT_TAG, "svcState {\"playbackState\":" + state + "}");
+    }
+  }
+
+  private void startHeartbeat(ExoPlayer player) {
+    heartbeat = () -> {
+      if (player.getMediaItemCount() > 0) {
+        MediaItem cur = player.getCurrentMediaItem();
+        Log.i(AUDIT_TAG, "hb {\"pos\":" + player.getCurrentPosition()
+            + ",\"qIdx\":" + player.getCurrentMediaItemIndex()
+            + ",\"id\":\"" + (cur != null ? cur.mediaId : "") + "\""
+            + ",\"playing\":" + player.isPlaying()
+            + ",\"rate\":" + player.getPlaybackParameters().speed + "}");
+      }
+      main.postDelayed(heartbeat, HEARTBEAT_MS);
+    };
+    main.postDelayed(heartbeat, HEARTBEAT_MS);
+  }
+
   @Override
   public void onDestroy() {
     instance = null;
+    if (heartbeat != null) { main.removeCallbacks(heartbeat); heartbeat = null; }
     if (mediaSession != null) {
       mediaSession.getPlayer().release();
       mediaSession.release();

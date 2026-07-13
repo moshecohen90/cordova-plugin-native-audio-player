@@ -7,14 +7,20 @@ Music and Apple Podcasts use.
 - **Android**: androidx Media3 (ExoPlayer + MediaSessionService + the default Media3
   notification). Foreground service with `mediaPlayback` type, so playback survives
   aggressive OEM battery managers.
-- **iOS**: AVPlayer / AVQueuePlayer + MPNowPlayingInfoCenter + MPRemoteCommandCenter,
-  with the `audio` background mode.
-- **Native playlist** (`setQueue`): the OS advances tracks with zero JavaScript, so
+- **iOS**: AVQueuePlayer + MPNowPlayingInfoCenter + MPRemoteCommandCenter, with the
+  `audio` background mode.
+- **Native queue** (`setQueue`): the OS advances items with zero JavaScript, so
   playback continues even when the WebView is frozen in the background.
-- Position events (~10 Hz) for driving UI sync (e.g. word/line highlighting),
-  transport-control events (play/pause/next/previous/seek), error events, per-track
-  clipping to a given duration, playback-rate control, and a silent keep-alive loop
-  for showing the OS player during non-file audio (e.g. device TTS).
+- **Event-driven protocol, no polling**: state changes are deduped natively; every
+  event carries `generation` + `seq` so stale/duplicated deliveries are droppable.
+  Position is available on demand via `getState()` — there are NO periodic position
+  events by design.
+- **Verse/segment boundaries**: items flagged `boundary: true` start a logical unit
+  (e.g. a verse). Lock-screen next/previous seek by boundary natively, so a queue of
+  he/en segment pairs navigates whole verses.
+- **Native TTS to file** (`synthesizeToFile` + `getVoices`): pre-synthesize device
+  TTS into cacheable audio files (with word timestamps where the engine supports
+  them), so TTS content can live in the same native queue as regular audio files.
 
 ## Install
 
@@ -40,55 +46,62 @@ the entry this plugin adds.
 ## Usage
 
 ```js
-// Play a single track (streams URLs, plays local file:// paths)
-NativeAudioPlayer.load({
-  url: 'https://example.com/track.mp3',
-  title: 'Genesis 1:1',
-  artist: 'My App',
-  album: '',
-  artwork: 'https://example.com/art-512.png',
-  durationMs: 0,          // >0 clips the track natively to this length
-  displayDurationMs: 0,   // >0 shows this length on the seekbar WITHOUT clipping
-  autoplay: true
+NativeAudioPlayer.setEvents(function (evt) {
+  // evt.type: 'state' | 'transition' | 'ended' | 'error'
+  // every payload: { type, generation, seq, ... }
+  // state:      { state: 'playing'|'paused'|'buffering'|'idle', reason?: 'user'|'interruption'|'focus'|'noisy', index, positionMs, rate }
+  // transition: { index, id, tag }
+  // error:      { code, message, index? }
 });
 
-// Native playlist: the OS advances tracks with no JS involved (background-safe)
-NativeAudioPlayer.setQueue([
-  { url: '...', id: 'track-1', title: '...', durationMs: 12000 },
-  { url: '...', id: 'track-2', title: '...', durationMs: 9000 }
-], 0 /* startIndex */, 0 /* startPositionMs */);
+NativeAudioPlayer.setQueue({
+  generation: 1,
+  items: [
+    { id: '1:0', url: 'https://example.com/gen-1-1-he.mp3', clipEndMs: 11800, boundary: true,
+      metadata: { title: 'Genesis 1:1', artist: 'My App', artworkUrl: 'https://example.com/art-512.png' },
+      tag: '{"verseIndex":"1.1.1","lang":"he"}' },
+    { id: '1:1', url: 'file:///.../gen-1-1-en.caf', boundary: false,
+      metadata: { title: 'Genesis 1:1', artist: 'My App' },
+      tag: '{"verseIndex":"1.1.1","lang":"en"}' }
+  ],
+  startIndex: 0,
+  startPositionMs: 0,
+  rate: 1.0,
+  autoplay: true
+}).then(...);
 
+NativeAudioPlayer.appendQueue({ generation: 1, items: [...] });   // rejects on stale generation
 NativeAudioPlayer.play();
-NativeAudioPlayer.pause();
-NativeAudioPlayer.stop();
-NativeAudioPlayer.seekTo(5000);
-NativeAudioPlayer.setRate(1.5);
-NativeAudioPlayer.updateMetadata({ title: 'New title' });
-NativeAudioPlayer.getPosition(function (p) { /* p.positionMs, p.durationMs */ });
+NativeAudioPlayer.pause();          // keeps the media card visible (paused)
+NativeAudioPlayer.stop();           // clears the queue and dismisses the card
+NativeAudioPlayer.seekToItem({ index: 4, positionMs: 0 });
+NativeAudioPlayer.setRate(1.5);     // pitch-preserving, persists across item advances
+NativeAudioPlayer.getState().then(function (s) {
+  // { generation, state, reason?, index, id, positionMs, durationMs, rate }
+});
 
-// Show the OS media player while playing non-file audio (e.g. device TTS):
-// loops a bundled silent track carrying your metadata + transport controls.
-NativeAudioPlayer.playSilentLoop({ title: 'Genesis 1:1' });
-
-// Events
-NativeAudioPlayer.on('position',   function (e) { /* e.positionMs, e.durationMs, e.index?, e.id? */ });
-NativeAudioPlayer.on('state',      function (e) { /* playing|paused|buffering|ended|stopped */ });
-NativeAudioPlayer.on('control',    function (e) { /* e.action: play|pause|next|previous|seek */ });
-NativeAudioPlayer.on('transition', function (e) { /* queue advanced: e.index, e.id */ });
-NativeAudioPlayer.on('ended',      function (e) { /* track (or whole queue) finished */ });
-NativeAudioPlayer.on('error',      function (e) { /* e.code, e.message */ });
+NativeAudioPlayer.getVoices().then(function (voices) {
+  // [{ id, name, locale, quality, requiresNetwork }]
+});
+NativeAudioPlayer.synthesizeToFile({
+  text: 'In the beginning...',
+  voiceId: 'com.apple.voice.compact.en-US.Samantha',
+  utteranceId: 'sha1-of-text-and-voice'
+}).then(function (r) {
+  // { fileUrl, durationMs, wordTimestamps: [{ charStart, charEnd, startMs }] }
+  // cached natively by utteranceId; synthesis always runs at rate 1.0
+});
 ```
 
 ## Behavior notes
 
-- With a single loaded track, the notification's next/previous buttons are forced
-  visible and forwarded to JS as `control` events (`next`/`previous`) so your app can
-  decide what they do. With a queue (`setQueue`), the OS navigates the playlist
-  natively and emits `transition` events.
-- Audio-focus loss (phone call, another app) pauses playback and emits a `pause`
-  control event so your UI can stay in sync.
-- `durationMs` clipping exists because some generated/VBR MP3s report wrong durations
-  or carry silent tails; clipping ends the track exactly where you say.
+- OS interruptions (phone call, Siri, focus loss, headphones unplugged) are absorbed
+  natively and surface only as deduped `state` events with a `reason`; interruption
+  end auto-resumes when the system allows it. JS needs zero recovery logic.
+- `clipEndMs` clipping exists because some generated/VBR MP3s report wrong durations
+  or carry silent tails; clipping ends the item exactly where you say, natively.
+- Debug builds log structured `[AUD]`/`AUD` markers (events, transitions, a 15s
+  heartbeat) to the native log for automated device testing. Release builds do not.
 
 ## Disclaimer
 

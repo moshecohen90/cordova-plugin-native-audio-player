@@ -1,18 +1,19 @@
 #import <Cordova/CDVPlugin.h>
+#import <AVFoundation/AVFoundation.h>
 
-@interface NativeAudioPlayer : CDVPlugin
+@interface NativeAudioPlayer : CDVPlugin <AVSpeechSynthesizerDelegate>
 
-- (void)startEvents:(CDVInvokedUrlCommand*)command;
-- (void)load:(CDVInvokedUrlCommand*)command;
+- (void)setEvents:(CDVInvokedUrlCommand*)command;
 - (void)setQueue:(CDVInvokedUrlCommand*)command;
 - (void)appendQueue:(CDVInvokedUrlCommand*)command;
-- (void)playSilentLoop:(CDVInvokedUrlCommand*)command;
 - (void)play:(CDVInvokedUrlCommand*)command;
 - (void)pause:(CDVInvokedUrlCommand*)command;
 - (void)stop:(CDVInvokedUrlCommand*)command;
-- (void)seekTo:(CDVInvokedUrlCommand*)command;
+- (void)seekToItem:(CDVInvokedUrlCommand*)command;
 - (void)setRate:(CDVInvokedUrlCommand*)command;
-- (void)updateMetadata:(CDVInvokedUrlCommand*)command;
-- (void)getPosition:(CDVInvokedUrlCommand*)command;
+- (void)getState:(CDVInvokedUrlCommand*)command;
+- (void)getVoices:(CDVInvokedUrlCommand*)command;
+- (void)synthesizeToFile:(CDVInvokedUrlCommand*)command;
+- (void)audit:(CDVInvokedUrlCommand*)command;
 
 @end

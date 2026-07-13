@@ -1,6 +1,6 @@
 {
   "name": "cordova-plugin-native-audio-player",
-  "version": "0.1.0",
+  "version": "2.0.0",
   "description": "Native background audio with a Spotify/YouTube-style OS media player (Android Media3, iOS AVPlayer + Now Playing).",
   "cordova": {
     "id": "cordova-plugin-native-audio-player",
