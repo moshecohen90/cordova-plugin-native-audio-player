@@ -16,6 +16,9 @@ import androidx.media3.common.MediaItem;
 import androidx.media3.common.Player;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
+import androidx.media3.extractor.DefaultExtractorsFactory;
+import androidx.media3.extractor.mp3.Mp3Extractor;
 import androidx.media3.session.MediaSession;
 import androidx.media3.session.MediaSessionService;
 
@@ -60,7 +63,11 @@ public class PlaybackService extends MediaSessionService {
     super.onCreate();
     instance = this;
     audit = (getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+    // Header-less VBR MP3s: measure length by reading frames, not from the first frame's bitrate.
+    DefaultExtractorsFactory extractors = new DefaultExtractorsFactory()
+        .setMp3ExtractorFlags(Mp3Extractor.FLAG_ENABLE_INDEX_SEEKING);
     ExoPlayer player = new ExoPlayer.Builder(this)
+        .setMediaSourceFactory(new DefaultMediaSourceFactory(this, extractors))
         .setAudioAttributes(
             new AudioAttributes.Builder()
                 .setUsage(C.USAGE_MEDIA)
