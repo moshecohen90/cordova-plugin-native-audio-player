@@ -42,6 +42,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Cordova bridge to the Media3 {@link PlaybackService}. Commands are marshalled onto the
@@ -470,8 +471,11 @@ public class NativeAudioPlayer extends CordovaPlugin {
 
   private Voice findVoice(String voiceId) {
     if (TextUtils.isEmpty(voiceId)) return tts.getVoice() != null ? tts.getVoice() : tts.getDefaultVoice();
-    for (Voice v : tts.getVoices()) {
-      if (v.getName().equals(voiceId)) return v;
+    // getVoices() is null, not empty, once the engine's service has gone away
+    Set<Voice> voices = tts.getVoices();
+    if (voices == null) return null;
+    for (Voice v : voices) {
+      if (voiceId.equals(v.getName())) return v;
     }
     return null;
   }
