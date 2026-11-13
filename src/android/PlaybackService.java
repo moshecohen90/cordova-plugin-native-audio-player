@@ -1,14 +1,22 @@
 package com.moshecohen.nativeaudio;
 
+import android.app.Notification;
+import android.app.NotificationManager;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
+import android.content.pm.ServiceInfo;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.service.notification.StatusBarNotification;
 import android.util.Log;
 
 import androidx.annotation.Nullable;
 import androidx.annotation.OptIn;
+import androidx.core.app.NotificationChannelCompat;
+import androidx.core.app.NotificationCompat;
+import androidx.core.app.NotificationManagerCompat;
 import androidx.media3.common.AudioAttributes;
 import androidx.media3.common.C;
 import androidx.media3.common.ForwardingPlayer;
@@ -16,13 +24,15 @@ import androidx.media3.common.MediaItem;
 import androidx.media3.common.Player;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.session.DefaultMediaNotificationProvider;
 import androidx.media3.session.MediaSession;
 import androidx.media3.session.MediaSessionService;
 
 /**
  * Media3 MediaSessionService. Owning the ExoPlayer here (not in the WebView) is what gives
  * the OS-native media notification / lock-screen player, reliable background playback and
- * audio focus. Media3 posts and tears down the foreground notification automatically.
+ * audio focus. Media3 posts and tears down the foreground notification automatically
+ * while playback runs; {@link #onStartCommand} covers the starts that play nothing.
  *
  * Queue items are verse SEGMENTS; items flagged boundary=true (metadata extras) start a
  * verse. The notification's next/previous seek by verse boundary NATIVELY, so lock-screen
@@ -30,13 +40,18 @@ import androidx.media3.session.MediaSessionService;
  */
 @OptIn(markerClass = UnstableApi.class)
 public class PlaybackService extends MediaSessionService {
+  private static final String TAG = "PlaybackService";
   private static final String AUDIT_TAG = "AUD";
   private static final long HEARTBEAT_MS = 15000;
+  private static final int NOTIFICATION_ID = DefaultMediaNotificationProvider.DEFAULT_NOTIFICATION_ID;
+  private static final String CHANNEL_ID = DefaultMediaNotificationProvider.DEFAULT_CHANNEL_ID;
 
   private MediaSession mediaSession = null;
   private final Handler main = new Handler(Looper.getMainLooper());
+  private final Runnable idleForegroundRelease = this::releaseIdleForeground;
   private Runnable heartbeat;
   private boolean audit;
+  private int lastStartId;
 
   // Same-process handle for reading the REAL player position. The plugin's
   // MediaController.getCurrentPosition() is an extrapolated estimate that can freeze
@@ -152,6 +167,93 @@ public class PlaybackService extends MediaSessionService {
     return mediaSession;
   }
 
+  /**
+   * Media keys and the paused notification's play button start this service with
+   * startForegroundService(), and the system then crashes the app unless startForeground()
+   * follows. Media3 only calls it once playback runs, so every start that finds the service
+   * in the background takes the foreground here and gives it back right after the command
+   * was dispatched, unless that command started playback.
+   */
+  @Override
+  public int onStartCommand(@Nullable Intent intent, int flags, int startId) {
+    lastStartId = startId;
+    boolean inBackground = !isPlaybackOngoing();
+    if (inBackground) {
+      enterForeground();
+    }
+    int result = super.onStartCommand(intent, flags, startId);
+    if (inBackground) {
+      main.removeCallbacks(idleForegroundRelease);
+      main.post(idleForegroundRelease);
+    }
+    return result;
+  }
+
+  /**
+   * Android 12+ refuses a foreground start from the background with a
+   * ForegroundServiceStartNotAllowedException (an IllegalStateException); such a start
+   * carries no foreground promise, so there is nothing left to fulfil.
+   */
+  private void enterForeground() {
+    Notification shown = shownMediaNotification();
+    try {
+      startMediaForeground(shown != null ? shown : placeholderNotification());
+    } catch (IllegalStateException e) {
+      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) throw e;
+      Log.w(TAG, "Foreground start refused", e);
+    }
+  }
+
+  private void startMediaForeground(Notification notification) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+      startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+    } else {
+      startForeground(NOTIFICATION_ID, notification);
+    }
+  }
+
+  /** Media3's own notification when it is on screen, so taking the foreground changes nothing visible. */
+  @Nullable
+  private Notification shownMediaNotification() {
+    NotificationManager manager = getSystemService(NotificationManager.class);
+    for (StatusBarNotification shown : manager.getActiveNotifications()) {
+      if (shown.getId() == NOTIFICATION_ID && shown.getTag() == null) return shown.getNotification();
+    }
+    return null;
+  }
+
+  /** Same id and channel as Media3's notification, which replaces this one when playback starts. */
+  private Notification placeholderNotification() {
+    NotificationManagerCompat.from(this).createNotificationChannel(
+        new NotificationChannelCompat.Builder(CHANNEL_ID, NotificationManagerCompat.IMPORTANCE_LOW)
+            .setName(getString(DefaultMediaNotificationProvider.DEFAULT_CHANNEL_NAME_RESOURCE_ID))
+            .build());
+    return new NotificationCompat.Builder(this, CHANNEL_ID)
+        .setSmallIcon(androidx.media3.session.R.drawable.media3_notification_small_icon)
+        .setContentTitle(getApplicationInfo().loadLabel(getPackageManager()))
+        .build();
+  }
+
+  /**
+   * Hands the notification back to Media3, which drops the foreground and removes whatever
+   * it would not show itself. A service left with an empty queue stops, unless a newer
+   * start is already on its way.
+   */
+  private void releaseIdleForeground() {
+    if (mediaSession == null || isPlaybackStarting()) return;
+    onUpdateNotification(mediaSession, /* startInForegroundRequired= */ false);
+    if (mediaSession.getPlayer().getMediaItemCount() == 0) {
+      stopSelf(lastStartId);
+    }
+  }
+
+  /** Media3's own condition for running in the foreground, read from the real player. */
+  private boolean isPlaybackStarting() {
+    Player player = mediaSession.getPlayer();
+    int state = player.getPlaybackState();
+    return player.getPlayWhenReady() && (state == Player.STATE_READY || state == Player.STATE_BUFFERING);
+  }
+
   @Override
   public void onTaskRemoved(@Nullable Intent rootIntent) {
     Player player = mediaSession != null ? mediaSession.getPlayer() : null;
@@ -206,6 +308,7 @@ public class PlaybackService extends MediaSessionService {
   @Override
   public void onDestroy() {
     instance = null;
+    main.removeCallbacks(idleForegroundRelease);
     if (heartbeat != null) { main.removeCallbacks(heartbeat); heartbeat = null; }
     if (mediaSession != null) {
       mediaSession.getPlayer().release();
